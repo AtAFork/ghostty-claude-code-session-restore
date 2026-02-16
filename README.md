@@ -1,128 +1,93 @@
 # Ghostty Session Manager
 
-Save and restore Claude Code sessions across Ghostty restarts and reboots.
+Save and restore Ghostty tabs running Claude Code or Codex across Ghostty restarts and reboots.
 
 ## Problem
 
-When you quit Ghostty (or restart your computer), all your Claude Code sessions are lost. If you had 10 tabs open with different conversations — including multiple sessions in the same project directory — you'd have to manually re-open each one and figure out which conversation to resume.
+When Ghostty quits, running AI CLI sessions are gone. Rebuilding multi-tab setups manually is slow, especially when multiple tabs share the same project directory.
+
+## What This Restores
+
+- Claude sessions (`claude`)
+- Codex sessions (`codex`)
+- Original working directory per tab
+- Relevant CLI flags (including flags with values, like `--model sonnet`)
 
 ## How It Works
 
-### Architecture
+### Components
 
-Two components work together:
+Two pieces work together:
 
-```
+```text
 ghostty-session-watcher (launchd daemon, runs outside Ghostty)
-├── Every 2s: check if Ghostty is running
-├── On PID change: snapshot Ghostty-only claude processes (PIDs, CWDs, args)
-├── On Ghostty quit: extract session IDs + flags, save restore file
-└── Runs at login, survives reboots (KeepAlive)
+├── Every 2s: checks if Ghostty is running
+├── On state change: snapshots Ghostty-only claude/codex processes
+├── On Ghostty quit: resolves session IDs + flags and writes restore file
+└── Runs at login and restarts automatically (KeepAlive)
 
-.bashrc snippet + restore.sh (runs inside Ghostty on shell startup)
-├── Detects restore file exists
-├── Acquires a lock (prevents multiple shells from restoring simultaneously)
-├── Calls ghostty-restore --auto to create tabs via AppleScript Cmd+T
-├── Types cd + claude commands into each tab
-└── Runs first session directly in the original shell
+shell startup snippet + ghostty-restore (runs inside Ghostty)
+├── Detects pending restore file
+├── Acquires lock (prevents concurrent restores)
+├── Calls ghostty-restore --auto (creates tabs via AppleScript Cmd+T)
+├── Starts sessions 2..N in new tabs
+└── Starts session 1 in the original shell
 ```
 
-### Save: The Snapshot Approach
+### Snapshot Strategy
 
-The watcher snapshots running sessions **every 2 seconds** (only when PIDs change — zero I/O otherwise). Each snapshot captures:
+The watcher snapshots live interactive sessions while Ghostty is still running, then uses the last snapshot after quit.
 
-- **PID** and **TTY** (for tab ordering)
-- **CWD** (working directory)
-- **Full command args** (`--chrome`, `--dangerously-skip-permissions`, `--resume <id>`, etc.)
+Each snapshot entry stores:
 
-When Ghostty quits, the most recent snapshot — taken while everything was still alive — becomes the save state.
-
-- **Close a single tab**: The claude process exits. Next snapshot no longer includes it. It won't be restored.
-- **Quit Ghostty entirely**: All processes die simultaneously. The watcher uses the last snapshot (from before the quit) to save all sessions.
+- `pid`
+- `tty` (tab ordering)
+- `cwd`
+- `tool` (`claude` or `codex`)
+- full command `args`
+- `sessionId` when directly detectable (notably Codex via open rollout file)
 
 ### Ghostty-Only Filtering
 
-The watcher **only captures claude processes running inside Ghostty**, not other terminals. For each claude process on a TTY, it walks up the parent process chain (PPID, up to 6 levels) and checks if any ancestor is the `ghostty` binary. This prevents contamination from:
-
-- Solo terminal sessions
-- iTerm sessions
-- VS Code / Cursor integrated terminals
-- Any other terminal emulator
+Only processes with a Ghostty ancestor in their PPID chain are captured. This excludes sessions from iTerm, VS Code/Cursor terminals, etc.
 
 ### Session ID Resolution
 
-Session IDs are resolved using a three-tier approach:
+#### Claude
 
-1. **From `--resume <id>` in args** (exact match): If the process was started with `--resume`, the session ID is extracted directly from the command line arguments. This is always correct and covers all previously-restored sessions.
+1. Use `--resume <id>` if present in process args.
+2. Otherwise resolve by project history in `~/.claude/projects`, filtered to real conversations (`"type":"user"` present).
+3. Fallback to `claude --continue` when no session ID can be resolved.
 
-2. **From project directory session files** (for fresh sessions, including multiple tabs in the same project): For processes without `--resume`, the watcher finds the Claude project directory for the CWD, lists all `.jsonl` session files, and filters to **real conversations only** — files that contain at least one `"type":"user"` entry. Stub files from failed restore attempts (which only contain `file-history-snapshot` entries) are skipped. The N most recently modified real session files are assigned to the N unresolved processes in that project.
+#### Codex
 
-   This correctly handles multiple tabs in the same project directory: if you have 2 tabs in `~/project-a`, the 2 most recently active real conversations from that project are restored.
+1. Prefer session ID extracted from open rollout file (`~/.codex/sessions/.../rollout-...-<uuid>.jsonl`) while the process is alive.
+2. Otherwise use `codex resume <id>` if present in args.
+3. Fallback to `codex resume --last`.
 
-3. **`--continue` fallback**: If no real session file can be found (e.g., the user started claude but never sent a message, or the project has no session history), the restore uses `claude --continue` which automatically continues the most recent conversation in that project directory.
+### Restore Behavior
 
-After a successful restore cycle, all sessions will have `--resume <id>` in their args (since the restore starts them with `--resume`). Tiers 2 and 3 are only needed for sessions the user started manually.
+For each saved session:
 
-These tiers were chosen after extensive testing showed that simpler approaches are unreliable:
-
-- **`history.jsonl`** stores the `project` field as the git root, not the CWD. Multiple subdirectory sessions map to the same project, making CWD-based matching fail.
-- **File birth time matching** gets poisoned by stub `.jsonl` files created during failed restore attempts. Each failed `claude --resume 'bad-id'` creates a new session file that matches the next birth time search.
-- **File mtime sorting** picks the most recently touched file in a directory that may contain dozens of old sessions, with no reliable way to correlate a specific PID to a specific file.
-
-After a successful restore cycle, all sessions will have `--resume <id>` in their args (since the restore script starts them with `--resume`). The `--continue` fallback is only needed for sessions the user started manually.
-
-### CLI Flag Preservation
-
-All CLI flags are captured from the running process's command line and stored in the restore file. When sessions are restored, they launch with the same flags:
-
-```
-Original:   claude --chrome --dangerously-skip-permissions
-Saved as:   { "flags": "--chrome --dangerously-skip-permissions", ... }
-Restored:   claude --resume <id> --chrome --dangerously-skip-permissions
-         or claude --continue --chrome --dangerously-skip-permissions
-```
-
-Flags that are preserved include:
-- `--chrome` (Chrome MCP integration)
-- `--dangerously-skip-permissions` (bypass permission prompts)
-- `--verbose`, `--model`, and any other CLI flags
-
-The `--resume` and `--continue` flags are handled separately and stripped from the saved flags to avoid duplication.
-
-### Restore: Automatic via .bashrc + AppleScript
-
-When Ghostty opens, the `.bashrc` snippet:
-
-1. Checks if `TERM_PROGRAM == ghostty` (skips in other terminals)
-2. Checks if `~/.claude/ghostty-restore.json` exists
-3. Acquires a lock via `mkdir` (atomic, prevents race conditions from multiple tabs)
-4. Calls `ghostty-restore --auto` which:
-   - Parses the restore file into arrays of session IDs, CWDs, and flags
-   - For sessions 2..N: creates new tabs via AppleScript `Cmd+T` keystrokes
-   - Types `cd '/path' && claude --resume '<id>' <flags>` (or `claude --continue <flags>`) into each tab
-   - Switches back to Tab 1 with `Cmd+1`
-5. Runs the first session directly in the original shell
-6. Deletes the restore file
-
-**Why AppleScript from inside Ghostty?** Tab creation via `Cmd+T` requires Accessibility permission. Running AppleScript from inside Ghostty inherits Ghostty's existing Accessibility permission. Running from the launchd daemon would require adding `/bin/bash` to Accessibility, which macOS doesn't allow (only app bundles).
-
-**Why not `open -na Ghostty.app`?** Each `open -na` invocation creates a **separate Ghostty process**, and windows from different instances cannot be merged into tabs. `Cmd+T` creates real tabs in the same window.
-
-### No Merge — Clean Saves Only
-
-Each save completely overwrites the restore file. Previous versions merged new saves with existing restore data, which caused stale sessions from failed restores to persist and reappear. The current design: whatever was running when Ghostty quit is exactly what gets restored.
+- `tool=claude` + `sessionId` -> `claude --resume <id> ...flags`
+- `tool=claude` + no `sessionId` -> `claude --continue ...flags`
+- `tool=codex` + `sessionId` -> `codex resume <id> ...flags`
+- `tool=codex` + no `sessionId` -> `codex resume --last ...flags`
 
 ## Prerequisites
 
-- **macOS** (uses `launchd`, `osascript`, macOS-specific process tools)
-- **Ghostty** terminal emulator
-- **Claude Code** CLI (`claude`)
-- **Python 3** (ships with macOS; used for JSON processing)
-- **Ghostty Accessibility permission**: System Settings > Privacy & Security > Accessibility > enable Ghostty
+- macOS (uses `launchd`, `osascript`, macOS `ps/lsof` behavior)
+- Ghostty
+- Python 3
+- At least one CLI to restore:
+  - `claude`
+  - `codex`
+- Ghostty Accessibility permission:
+  - System Settings -> Privacy & Security -> Accessibility -> enable Ghostty
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/AtAFork/ghostty-claude-code-session-restore.git
@@ -136,336 +101,209 @@ mkdir -p ~/.local/bin
 mkdir -p ~/.claude/debug
 ```
 
-### 3. Create symlinks for the scripts
+### 3. Symlink scripts
 
 ```bash
 ln -sf "$(pwd)/watcher.sh" ~/.local/bin/ghostty-session-watcher
 ln -sf "$(pwd)/restore.sh" ~/.local/bin/ghostty-restore
 ```
 
-### 4. Install the launchd plist
-
-The plist contains hardcoded paths that you must update for your username.
+### 4. Install launchd plist
 
 ```bash
-# Replace YOUR_USERNAME with your actual macOS username
 sed "s/YOUR_USERNAME/$(whoami)/g" com.user.ghostty-session-watcher.plist \
   > ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 ```
 
-> **Note:** The plist is a **copy**, not a symlink. launchd on macOS sometimes fails to follow symlinks for plist files.
+### 5. Add startup snippet
 
-### 5. Add the auto-restore snippet to your .bashrc
-
-Append the following to the end of your `~/.bashrc`:
+Add this to your shell startup file (`~/.bashrc`, `~/.bash_profile`, or `~/.zshrc` depending on your setup):
 
 ```bash
-# Auto-restore Claude Code sessions in Ghostty
+# Auto-restore Claude/Codex sessions in Ghostty
 if [[ "$TERM_PROGRAM" == "ghostty" ]] && [[ -f "$HOME/.claude/ghostty-restore.json" ]]; then
   if mkdir "$HOME/.claude/.ghostty-restore-lock" 2>/dev/null; then
-    _restore_first=$("$HOME/.local/bin/ghostty-restore" --auto 2>/dev/null)
+    _restore_first_json=$("$HOME/.local/bin/ghostty-restore" --auto 2>/dev/null)
     rmdir "$HOME/.claude/.ghostty-restore-lock" 2>/dev/null
-    if [[ -n "$_restore_first" ]]; then
-      IFS=$'\t' read -r _r_sid _r_cwd _r_flags <<< "$_restore_first"
-      cd "$_r_cwd" 2>/dev/null
-      if [[ -n "$_r_sid" ]]; then
-        if [[ -n "$_r_flags" ]]; then
-          eval "claude --resume '$_r_sid' $_r_flags"
+
+    if [[ -n "$_restore_first_json" ]]; then
+      _restore_parts=()
+      while IFS= read -r -d '' _part; do
+        _restore_parts+=("$_part")
+      done < <(
+        RESTORE_FIRST_JSON="$_restore_first_json" python3 - <<'PY'
+import json
+import os
+import sys
+
+try:
+    entry = json.loads(os.environ.get("RESTORE_FIRST_JSON", ""))
+except Exception:
+    raise SystemExit(0)
+
+tool = str(entry.get("tool") or "claude")
+sid = str(entry.get("sessionId") or "")
+cwd = str(entry.get("cwd") or "")
+flags = entry.get("flags")
+if not isinstance(flags, list):
+    flags = []
+
+for value in [tool, sid, cwd, *[x for x in flags if isinstance(x, str)]]:
+    sys.stdout.buffer.write(value.encode("utf-8", "ignore"))
+    sys.stdout.buffer.write(b"\0")
+PY
+      )
+
+      if [[ ${#_restore_parts[@]} -ge 3 ]]; then
+        _r_tool="${_restore_parts[0]}"
+        _r_sid="${_restore_parts[1]}"
+        _r_cwd="${_restore_parts[2]}"
+        _r_flags=("${_restore_parts[@]:3}")
+
+        cd "$_r_cwd" 2>/dev/null || true
+
+        if [[ "$_r_tool" == "codex" ]]; then
+          if [[ -n "$_r_sid" ]]; then
+            codex resume "$_r_sid" "${_r_flags[@]}"
+          else
+            codex resume --last "${_r_flags[@]}"
+          fi
         else
-          claude --resume "$_r_sid"
-        fi
-      else
-        if [[ -n "$_r_flags" ]]; then
-          eval "claude --continue $_r_flags"
-        else
-          claude --continue
+          if [[ -n "$_r_sid" ]]; then
+            claude --resume "$_r_sid" "${_r_flags[@]}"
+          else
+            claude --continue "${_r_flags[@]}"
+          fi
         fi
       fi
     fi
-    unset _restore_first _r_sid _r_cwd _r_flags
+
+    unset _restore_first_json _restore_parts _part _r_tool _r_sid _r_cwd _r_flags
   fi
 fi
 ```
 
-### 6. Load and start the watcher
+### 6. Start the watcher
 
 ```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 ```
 
-### 7. Verify installation
+### 7. Verify
 
 ```bash
-# Check the watcher is running
 launchctl print gui/$(id -u)/com.user.ghostty-session-watcher | head -5
-
-# Check the log (should show "Started")
 cat ~/.claude/debug/ghostty-session-watcher.log
 ```
 
-Open Ghostty, start a Claude Code session, quit Ghostty, then reopen it. Your session should auto-restore.
+## Runtime Files
 
-## Resource Usage
-
-The daemon is designed to be invisible:
-
-| Phase | What runs | Cost |
-|-------|-----------|------|
-| **Hot loop** (normal) | `pgrep ghostty` + `sleep 2` | ~0% CPU, 0 disk I/O |
-| **PID change** | `ps` + `lsof` + PPID chain walk per process | ~5ms, once per session open/close |
-| **Ghostty quit** | One `python3` invocation | ~50ms, once per quit |
-
-- **Memory**: ~2MB RSS for the bash process (just sleeping)
-- **Disk**: Snapshot file is <1KB in `/tmp`, overwritten only on state change
-- **Log file**: Auto-truncated at 50KB (never grows unbounded)
-- **Nice level**: 10 (low scheduling priority)
-- **I/O priority**: `LowPriorityBackgroundIO` in launchd
-
-No growing data structures. No memory leaks. Everything is read fresh each cycle.
-
-## Startup Behavior
-
-The launchd agent starts the watcher:
-- **On login** (RunAtLoad)
-- **On reboot** (automatically, since it runs at load)
-- **If it crashes** (KeepAlive restarts it with 5s throttle)
-
-Full flow after a reboot:
-
-```
-1. macOS boots, you log in
-2. launchd starts the watcher daemon
-3. You open Ghostty
-4. First shell's .bashrc detects the restore file
-5. ghostty-restore --auto creates tabs for each saved session
-6. Each tab starts claude with the original flags:
-   - Known session ID  →  claude --resume <id> <flags>
-   - Unknown session   →  claude --continue <flags>
-7. Restore file is deleted
-8. Watcher resumes snapshotting the new sessions
+```text
+/tmp/ghostty-session-snapshot.json              # Latest live snapshot
+~/.claude/ghostty-restore.json                  # Pending restore payload
+~/.claude/.ghostty-restore-lock/                # Startup lock
+~/.claude/debug/ghostty-session-watcher.log     # Main watcher log
 ```
 
-After this first restore cycle, all sessions will have `--resume <id>` in their args, so subsequent save/restore cycles will be exact.
+## Data Formats
 
-## Files
-
-### Source (this directory)
-
-```
-ghostty-session-manager/
-├── watcher.sh                              # Background daemon (save only)
-├── restore.sh                              # Restore script (creates tabs via AppleScript)
-├── com.user.ghostty-session-watcher.plist  # launchd agent configuration (template — needs username substitution)
-└── README.md                               # This file
-```
-
-### Installed
-
-```
-~/.local/bin/ghostty-session-watcher → ./watcher.sh  (symlink)
-~/.local/bin/ghostty-restore         → ./restore.sh  (symlink)
-~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist  (copy, not symlink)
-~/.bashrc                            # Auto-restore snippet appended at end of file
-```
-
-Note: The plist is a **copy**, not a symlink. launchd on macOS sometimes fails to follow symlinks for plist files (I/O error on bootstrap).
-
-### Runtime Files
-
-```
-/tmp/ghostty-session-snapshot.json       # Current session snapshot (ephemeral, <1KB)
-~/.claude/ghostty-restore.json           # Saved sessions pending restore (deleted after restore)
-~/.claude/.ghostty-restore-lock/         # Lock directory (created/removed atomically)
-~/.claude/debug/ghostty-session-watcher.log  # Daemon log (auto-truncated at 50KB)
-```
-
-### Snapshot Format
+### Snapshot format
 
 ```json
 [
   {
-    "pid": 12345,
-    "tty": "ttys007",
+    "pid": 61580,
+    "tty": "ttys000",
     "cwd": "/Users/you/project-a",
-    "args": "claude --chrome --dangerously-skip-permissions"
+    "tool": "codex",
+    "args": "codex --yolo resume",
+    "sessionId": "019c5bce-a952-7380-b204-bfe40bf783b6"
   },
   {
     "pid": 67890,
     "tty": "ttys010",
     "cwd": "/Users/you/project-b",
-    "args": "claude --resume 904135b4-... --chrome --dangerously-skip-permissions"
+    "tool": "claude",
+    "args": "claude --resume 904135b4-... --chrome"
   }
 ]
 ```
 
-### Restore File Format
+### Restore format
 
 ```json
 [
   {
-    "sessionId": null,
-    "cwd": "/Users/you/project-a",
-    "flags": "--chrome --dangerously-skip-permissions"
-  },
-  {
+    "tool": "claude",
     "sessionId": "904135b4-8584-42dd-aeb9-08b920d0e02e",
     "cwd": "/Users/you/project-b",
-    "flags": "--chrome --dangerously-skip-permissions"
+    "flags": ["--chrome", "--dangerously-skip-permissions"]
+  },
+  {
+    "tool": "codex",
+    "sessionId": null,
+    "cwd": "/Users/you/project-a",
+    "flags": ["--model", "gpt-5"]
   }
 ]
 ```
 
-- `sessionId` present → `claude --resume <id> <flags>`
-- `sessionId` null → `claude --continue <flags>`
-
 ## Manual Usage
 
-Normally everything is automatic. These are for debugging or edge cases.
-
 ```bash
-# Manual restore (if auto-restore didn't trigger)
+# Manual restore
 ghostty-restore
 
-# Check watcher status
-launchctl print gui/$(id -u)/com.user.ghostty-session-watcher
-
-# View watcher logs
-tail -20 ~/.claude/debug/ghostty-session-watcher.log
-
-# View current snapshot (what sessions are being tracked right now)
+# Inspect snapshot
 cat /tmp/ghostty-session-snapshot.json | python3 -m json.tool
 
-# Restart the watcher
-launchctl bootout gui/$(id -u)/com.user.ghostty-session-watcher
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
-
-# View the pending restore file
+# Inspect pending restore file
 cat ~/.claude/ghostty-restore.json | python3 -m json.tool
 
-# Clear the restore file (prevent next restore)
-rm ~/.claude/ghostty-restore.json
-
-# Remove a stale lock (if restore hangs)
-rmdir ~/.claude/.ghostty-restore-lock
-```
-
-## Troubleshooting
-
-### Sessions not being captured
-
-Check the snapshot file:
-```bash
-cat /tmp/ghostty-session-snapshot.json | python3 -m json.tool
-```
-
-If a session is missing, it might be running in a non-Ghostty terminal. The watcher only captures claude processes whose parent process chain includes `ghostty`.
-
-### "No conversation found" on restore
-
-This means the session ID in the restore file doesn't match any real conversation. This can only happen with `--resume` sessions. The `--continue` fallback avoids this by always picking the most recent valid conversation.
-
-To fix: clear the restore file and let sessions restart fresh:
-```bash
-rm ~/.claude/ghostty-restore.json
-```
-
-### Session picker appears instead of auto-resuming
-
-If a tab shows the "Resume Session" picker UI, it means the session was started without `--resume` or `--continue`. This shouldn't happen with the current version — non-resume sessions always use `--continue`.
-
-### Extra or phantom tabs
-
-Previous versions merged saves, which caused stale sessions to persist. The current version overwrites completely on each save. If you see phantom tabs, clear the restore file:
-```bash
-rm ~/.claude/ghostty-restore.json
-```
-
-### Accessibility permission
-
-Ghostty must have Accessibility permission in System Settings > Privacy & Security > Accessibility for AppleScript tab creation to work. The restore script runs inside Ghostty and inherits its permission.
-
-### Watcher not starting
-
-```bash
-# Check if it's loaded
-launchctl print gui/$(id -u)/com.user.ghostty-session-watcher
-
-# Check for errors
-cat ~/.claude/debug/ghostty-session-watcher-stderr.log
-
-# Verify the plist is valid
-plutil -lint ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
-
-# Re-bootstrap
+# Restart watcher
 launchctl bootout gui/$(id -u)/com.user.ghostty-session-watcher 2>/dev/null
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 ```
 
-## Design Decisions
+## Troubleshooting
 
-### Why filter session files by content instead of using simpler methods?
+### Sessions are missing
 
-For sessions without `--resume` in their args, the session ID is not externally observable. We explored and rejected several simpler approaches:
+- Confirm Ghostty ancestry filtering is expected for your workflow.
+- Check current snapshot:
 
-1. **`history.jsonl` lookup**: The `project` field stores the git root, not the CWD. Sessions in `~/project/subdir-a/` and `~/project/subdir-b/` both log `project: ~/project`, making matching ambiguous.
+```bash
+cat /tmp/ghostty-session-snapshot.json | python3 -m json.tool
+```
 
-2. **File birth time matching**: A fresh `claude` invocation creates a `.jsonl` session file. We can match the file's birth time to the process's start time. However, failed restore attempts also create stub session files (containing only `file-history-snapshot` entries, no real conversation data), poisoning the pool. The birth time search then matches these stubs instead of real conversations.
+### Restore opens wrong Claude thread for unresolved sessions
 
-3. **File mtime sorting without content check**: A project directory can contain dozens of old session files plus stubs from failed restores. Without checking content, mtime sorting picks stubs (which have very recent mtimes) over real conversations.
+This can happen only for Claude sessions without a known `sessionId`; fallback is `claude --continue`.
 
-The current approach reads the first 10 lines of each candidate `.jsonl` file and checks for `"type":"user"` entries. This reliably distinguishes real conversations from stubs with zero false positives. The N most recently modified real files are assigned to the N unresolved processes. `--continue` remains as a final fallback when no real session files exist at all.
+### Codex fallback picks the wrong thread
 
-### Why Ghostty-only filtering?
+If no Codex `sessionId` is available, fallback is `codex resume --last`.
 
-Without filtering, the watcher captures claude processes from ALL terminals (Solo, iTerm, VS Code, etc.). This caused phantom sessions to appear in saves — a Solo terminal session would be saved as a "Ghostty session" and then fail to restore because it was never in Ghostty.
+### Watcher not starting
 
-The PPID chain walk (checking if any ancestor process is `ghostty`) is the most reliable filter. It correctly handles the process hierarchy: `ghostty → login → bash → claude`.
-
-### Why a background daemon instead of a Ghostty quit hook?
-
-Ghostty doesn't have a "before quit" hook. By the time you could detect the quit, all child processes are already dead and their session info is lost. The daemon snapshots while everything is still alive.
-
-### Why bash instead of Python for the daemon?
-
-The hot loop is just `pgrep` + `sleep` — ~0% CPU. Python would add ~20MB RSS for the interpreter overhead. Python is only invoked for JSON escaping (on PID changes) and session saving (on quit).
-
-### Why `mkdir` for locking?
-
-`mkdir` is atomic on all filesystems. `flock` is not reliably available on all macOS versions. The lock prevents multiple `.bashrc` instances from running the restore simultaneously when Ghostty opens multiple tabs at once.
-
-### Why a copy of the plist instead of a symlink?
-
-launchd on macOS sometimes fails to follow symlinks for plist files, returning "I/O error" on bootstrap. A direct copy avoids this.
-
-### Why no merge on save?
-
-Merging caused stale sessions from failed restores to persist across multiple quit/reopen cycles. Clean overwrites ensure the restore file always reflects exactly what was running when Ghostty quit — nothing more, nothing less.
+```bash
+launchctl print gui/$(id -u)/com.user.ghostty-session-watcher
+cat ~/.claude/debug/ghostty-session-watcher-stderr.log
+plutil -lint ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
+```
 
 ## Limitations
 
-- **2-second granularity**: If you close a tab and quit Ghostty within 2 seconds, that closed tab's session might appear in the restore.
-- **Accessibility permission**: Ghostty must have Accessibility permission for AppleScript tab creation.
-- **`--continue` picks most recent**: For fresh sessions (no `--resume`), `--continue` resumes the most recent conversation in the project. If you had two fresh sessions in the same project directory, both would resume the same conversation. After one restore cycle, each gets a unique `--resume <id>` and this is no longer an issue.
-- **macOS only**: Uses `launchd`, `osascript`, and Ghostty-specific AppleScript.
-- **Single window**: All sessions restore as tabs in one window. Multi-window layouts are not preserved.
+- 2-second snapshot granularity: closing a tab right before quitting Ghostty can race.
+- macOS/Ghostty-specific by design.
+- Restores to one window as tabs (multi-window layouts are not preserved).
 
 ## Uninstall
 
 ```bash
-# Stop and remove the launchd agent
 launchctl bootout gui/$(id -u)/com.user.ghostty-session-watcher
 rm ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
-
-# Remove symlinks
 rm ~/.local/bin/ghostty-session-watcher ~/.local/bin/ghostty-restore
-
-# Remove the .bashrc snippet
-# Edit ~/.bashrc and delete from "# Auto-restore Claude Code sessions in Ghostty" to the final "fi"
-
-# Clean up runtime files
 rm -f ~/.claude/ghostty-restore.json /tmp/ghostty-session-snapshot.json
 rmdir ~/.claude/.ghostty-restore-lock 2>/dev/null
-
-# Remove the source directory (adjust path to where you cloned it)
-rm -rf ~/ghostty-session-manager
 ```

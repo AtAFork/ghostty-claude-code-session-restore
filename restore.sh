@@ -1,157 +1,188 @@
-#!/bin/bash
-# ghostty-restore — Restore Claude Code sessions as Ghostty tabs.
-#
-# Must run INSIDE Ghostty (needs its Accessibility permission for AppleScript).
-# Called automatically from .bashrc (--auto) or manually by the user.
-#
-# --auto: Create tabs silently, output first session's sid\tcwd\tflags for .bashrc to run.
-# manual: Show sessions, confirm, create tabs, run first session in current shell.
-#
-# Session types:
-#   sessionId present → claude --resume <id> <flags>
-#   sessionId null    → claude --continue <flags>  (continues most recent conversation)
+#!/usr/bin/env python3
+"""ghostty-restore — restore saved Claude/Codex sessions as Ghostty tabs."""
 
-set -uo pipefail
+from __future__ import annotations
 
-RESTORE_FILE="$HOME/.claude/ghostty-restore.json"
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-auto=false
-[[ "${1:-}" == "--auto" ]] && auto=true
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-if [[ ! -f "$RESTORE_FILE" ]]; then
-  $auto || echo "No saved sessions to restore."
-  exit 0
-fi
+from session_restore_core import (  # noqa: E402
+    build_restore_argv,
+    build_tab_command,
+    load_restore_file,
+    normalize_restore_entry,
+)
 
-# Parse restore file into parallel arrays
-eval "$(python3 -c "
-import json, os, sys
+RESTORE_FILE = Path.home() / ".claude" / "ghostty-restore.json"
 
-try:
-    with open(os.path.expanduser('$RESTORE_FILE')) as f:
-        sessions = json.loads(f.read())
-except:
-    sys.exit(1)
 
-if not sessions:
-    sys.exit(1)
+def applescript_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
-sids = ' '.join(f\"'{s.get('sessionId') or ''}'\" for s in sessions)
-cwds = ' '.join(f\"'{s['cwd']}'\" for s in sessions)
-flags = ' '.join(f\"'{s.get('flags', '')}'\" for s in sessions)
-print(f'_sids=({sids})')
-print(f'_cwds=({cwds})')
-print(f'_flags=({flags})')
-" 2>/dev/null)" || { $auto || echo "No valid sessions."; exit 1; }
 
-total=${#_sids[@]}
-[[ $total -eq 0 ]] && exit 0
+def create_tab_and_run(command: str) -> bool:
+    escaped = applescript_escape(command)
+    script = (
+        'tell application "System Events" to tell process "ghostty"\n'
+        '  keystroke "t" using command down\n'
+        "  delay 0.3\n"
+        f'  keystroke "{escaped}"\n'
+        "  delay 0.1\n"
+        "  key code 36\n"
+        "end tell\n"
+    )
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
 
-# Filter out sessions with missing directories
-declare -a sids=()
-declare -a cwds=()
-declare -a flags=()
-for i in $(seq 0 $((total - 1))); do
-  if [[ -d "${_cwds[$i]}" ]]; then
-    sids+=("${_sids[$i]}")
-    cwds+=("${_cwds[$i]}")
-    flags+=("${_flags[$i]}")
-  else
-    $auto || echo "  Skipping — ${_cwds[$i]} gone"
-  fi
-done
-total=${#sids[@]}
-[[ $total -eq 0 ]] && exit 0
 
-if ! $auto; then
-  echo "Found $total saved Claude Code session(s):"
-  for i in $(seq 0 $((total - 1))); do
-    local_flags=""
-    [[ -n "${flags[$i]}" ]] && local_flags=" [${flags[$i]}]"
-    if [[ -n "${sids[$i]}" ]]; then
-      echo "  $((i+1)). ${cwds[$i]}  (resume ${sids[$i]:0:8}...)${local_flags}"
-    else
-      echo "  $((i+1)). ${cwds[$i]}  (continue most recent)${local_flags}"
-    fi
-  done
-  read -rp "Restore all? [Y/n] " confirm
-  [[ "$confirm" =~ ^[Nn] ]] && { echo "Cancelled."; exit 0; }
-fi
+def switch_to_tab_one() -> bool:
+    script = (
+        'tell application "System Events" to tell process "ghostty"\n'
+        '  keystroke "1" using command down\n'
+        "end tell\n"
+    )
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
 
-# Build the claude command for a given session index
-build_cmd() {
-  local idx=$1
-  local sid="${sids[$idx]}"
-  local cwd="${cwds[$idx]}"
-  local f="${flags[$idx]}"
 
-  local cmd="cd '${cwd}'"
-  if [[ -n "$sid" ]]; then
-    # Known session ID: resume exactly
-    cmd+=" && claude --resume '${sid}'"
-  else
-    # Unknown session ID: continue most recent conversation
-    cmd+=" && claude --continue"
-  fi
-  if [[ -n "$f" ]]; then
-    cmd+=" ${f}"
-  fi
-  echo "$cmd"
-}
+def describe_entry(entry: dict, index: int) -> str:
+    entry = normalize_restore_entry(entry)
+    tool = entry["tool"]
+    sid = entry["sessionId"]
+    cwd = entry["cwd"]
+    flags = " ".join(entry["flags"]).strip()
+    flags_text = f" [{flags}]" if flags else ""
 
-# Create tabs for sessions 2..N via AppleScript (runs inside Ghostty = has permission)
-for i in $(seq 1 $((total - 1))); do
-  cmd=$(build_cmd "$i")
-  # Escape for AppleScript double-quoted string
-  cmd_safe=$(printf '%s' "$cmd" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    if tool == "codex":
+        mode = f"resume {sid[:8]}..." if sid else "resume --last"
+    else:
+        mode = f"resume {sid[:8]}..." if sid else "continue most recent"
+    return f"  {index}. [{tool}] {cwd}  ({mode}){flags_text}"
 
-  osascript -e "
-    tell application \"System Events\" to tell process \"ghostty\"
-      keystroke \"t\" using command down
-      delay 0.3
-      keystroke \"${cmd_safe}\"
-      delay 0.1
-      key code 36
-    end tell
-  " 2>/dev/null
 
-  sleep 0.3
-done
+def load_sessions(auto: bool) -> list[dict]:
+    if not RESTORE_FILE.exists():
+        if not auto:
+            print("No saved sessions to restore.")
+        return []
 
-# Switch back to first tab
-if [[ $total -gt 1 ]]; then
-  osascript -e '
-    tell application "System Events" to tell process "ghostty"
-      keystroke "1" using command down
-    end tell
-  ' 2>/dev/null
-  sleep 0.2
-fi
+    sessions = load_restore_file(RESTORE_FILE)
+    if not sessions:
+        if not auto:
+            print("No valid sessions.")
+        return []
 
-# Clean up
-rm -f "$RESTORE_FILE"
+    filtered = []
+    for entry in sessions:
+        cwd = entry["cwd"]
+        if Path(cwd).is_dir():
+            filtered.append(entry)
+        elif not auto:
+            print(f"  Skipping - {cwd} gone")
+    return filtered
 
-if $auto; then
-  # Output first session info for .bashrc to pick up and run
-  # Format: sid\tcwd\tflags (sid may be empty for --continue sessions)
-  printf '%s\t%s\t%s' "${sids[0]}" "${cwds[0]}" "${flags[0]}"
-else
-  # Manual mode: run first session directly
-  cd "${cwds[0]}"
-  echo "Restored $total session(s). Starting first session..."
-  local_flags="${flags[0]}"
-  local_sid="${sids[0]}"
-  if [[ -n "$local_sid" ]]; then
-    if [[ -n "$local_flags" ]]; then
-      eval "claude --resume '$local_sid' $local_flags"
-    else
-      claude --resume "$local_sid"
-    fi
-  else
-    if [[ -n "$local_flags" ]]; then
-      eval "claude --continue $local_flags"
-    else
-      claude --continue
-    fi
-  fi
-fi
+
+def auto_output_first_session(entry: dict) -> None:
+    # Keep auto mode output machine-readable for shell startup snippets.
+    print(json.dumps(entry, separators=(",", ":")))
+
+
+def run_first_session(entry: dict) -> int:
+    entry = normalize_restore_entry(entry)
+    cwd = entry["cwd"]
+    argv = build_restore_argv(entry)
+
+    try:
+        os.chdir(cwd)
+    except OSError as exc:
+        print(f"Failed to cd into {cwd}: {exc}", file=sys.stderr)
+        return 1
+
+    print("Starting first session...")
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as exc:
+        print(f"Failed to launch {' '.join(argv)}: {exc}", file=sys.stderr)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--auto", action="store_true")
+    parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    sessions = load_sessions(args.auto)
+    if not sessions:
+        return 0
+
+    if not args.auto:
+        print(f"Found {len(sessions)} saved session(s):")
+        for idx, entry in enumerate(sessions, start=1):
+            print(describe_entry(entry, idx))
+        confirm = input("Restore all? [Y/n] ").strip().lower()
+        if confirm.startswith("n"):
+            print("Cancelled.")
+            return 0
+
+    remaining_sessions_for_retry = []
+
+    # Create tabs for sessions 2..N.
+    for idx, entry in enumerate(sessions[1:], start=1):
+        ok = create_tab_and_run(build_tab_command(entry))
+        if not ok:
+            remaining_sessions_for_retry = sessions[idx:]
+            break
+        time.sleep(0.3)
+
+    if len(sessions) > 1 and not remaining_sessions_for_retry:
+        switch_to_tab_one()
+        time.sleep(0.2)
+
+    if remaining_sessions_for_retry:
+        # Preserve unresolved tail sessions for a retry on next startup.
+        try:
+            RESTORE_FILE.write_text(
+                json.dumps(remaining_sessions_for_retry, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        if not args.auto:
+            print(
+                f"Warning: failed to create some tabs; preserved "
+                f"{len(remaining_sessions_for_retry)} session(s) for retry."
+            )
+    else:
+        try:
+            RESTORE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    first = normalize_restore_entry(sessions[0])
+    if args.auto:
+        auto_output_first_session(first)
+        return 0
+    return run_first_session(first)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
