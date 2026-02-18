@@ -176,6 +176,10 @@ def load_sessions_file(path: Path) -> list[dict]:
 
 def persist_live_state(entries: list[dict]) -> int:
     sessions = resolve_sessions(entries, str(CLAUDE_PROJECTS_PATH))
+    if not sessions:
+        # Keep the previous non-empty live state. This avoids clobbering restore
+        # data on transient empty snapshots (for example during crash races).
+        return 0
     write_json_atomic(LIVE_STATE_PATH, sessions)
     return len(sessions)
 

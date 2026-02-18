@@ -76,6 +76,32 @@ class WatcherBehaviorTests(unittest.TestCase):
             restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
             self.assertEqual(restored, live_payload)
 
+    def test_persist_live_state_keeps_previous_non_empty_on_empty_snapshot(self) -> None:
+        watcher = load_watcher_module()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watcher.LIVE_STATE_PATH = root / "ghostty-live-state.json"
+            watcher.CLAUDE_PROJECTS_PATH = root / "projects"
+
+            existing_payload = [
+                {
+                    "tool": "claude",
+                    "sessionId": "904135b4-8584-42dd-aeb9-08b920d0e02e",
+                    "cwd": "/tmp/proj",
+                    "flags": ["--model", "sonnet"],
+                }
+            ]
+            watcher.LIVE_STATE_PATH.write_text(
+                json.dumps(existing_payload), encoding="utf-8"
+            )
+
+            saved = watcher.persist_live_state([])
+            self.assertEqual(saved, 0)
+
+            after = json.loads(watcher.LIVE_STATE_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(after, existing_payload)
+
     def test_snapshot_log_message_throttles_unresolved_codex_note(self) -> None:
         watcher = load_watcher_module()
 
