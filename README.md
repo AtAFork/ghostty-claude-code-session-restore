@@ -23,7 +23,8 @@ Two pieces work together:
 ghostty-session-watcher (launchd daemon, runs outside Ghostty)
 ├── Every 2s: checks if Ghostty is running
 ├── On state change: snapshots Ghostty-only claude/codex processes
-├── On Ghostty quit: resolves session IDs + flags and writes restore file
+├── On state change: continuously writes resolved live-state file
+├── On Ghostty quit: writes restore file from live-state (or snapshot fallback)
 └── Runs at login and restarts automatically (KeepAlive)
 
 shell startup snippet + ghostty-restore (runs inside Ghostty)
@@ -201,6 +202,7 @@ cat ~/.claude/debug/ghostty-session-watcher.log
 ```text
 /tmp/ghostty-session-snapshot.json              # Latest live snapshot
 ~/.claude/ghostty-restore.json                  # Pending restore payload
+~/.claude/ghostty-live-state.json               # Continuously updated latest state
 ~/.claude/.ghostty-restore-lock/                # Startup lock
 ~/.claude/debug/ghostty-session-watcher.log     # Main watcher log
 ```

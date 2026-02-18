@@ -114,6 +114,64 @@ class RestoreAutoTests(unittest.TestCase):
             self.assertEqual(out["sessionId"], "019c5bce-a952-7380-b204-bfe40bf783b6")
             self.assertEqual(out["flags"], ["--model", "gpt-5", "--search"])
 
+    def test_auto_mode_falls_back_to_live_state_when_restore_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            cwd = home / "project-live-only"
+            cwd.mkdir(parents=True, exist_ok=True)
+
+            payload = [
+                {
+                    "tool": "claude",
+                    "sessionId": "904135b4-8584-42dd-aeb9-08b920d0e02e",
+                    "cwd": str(cwd),
+                    "flags": ["--model", "sonnet"],
+                }
+            ]
+            live_state_path = claude_dir / "ghostty-live-state.json"
+            live_state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            proc = self.run_restore_auto(home)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["tool"], "claude")
+            self.assertEqual(out["cwd"], str(cwd))
+            self.assertFalse(
+                live_state_path.exists(),
+                "Live-state file should be cleared after successful restore.",
+            )
+
+    def test_auto_mode_uses_live_state_when_restore_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            cwd = home / "project-live-fallback"
+            cwd.mkdir(parents=True, exist_ok=True)
+
+            (claude_dir / "ghostty-restore.json").write_text("[]", encoding="utf-8")
+            payload = [
+                {
+                    "tool": "codex",
+                    "sessionId": "019c5bce-a952-7380-b204-bfe40bf783b6",
+                    "cwd": str(cwd),
+                    "flags": ["--model", "gpt-5"],
+                }
+            ]
+            (claude_dir / "ghostty-live-state.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+            proc = self.run_restore_auto(home)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["tool"], "codex")
+            self.assertEqual(out["cwd"], str(cwd))
+
     def test_auto_mode_preserves_unlaunched_sessions_when_osascript_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)

@@ -23,6 +23,7 @@ from session_restore_core import (  # noqa: E402
 )
 
 RESTORE_FILE = Path.home() / ".claude" / "ghostty-restore.json"
+LIVE_STATE_FILE = Path.home() / ".claude" / "ghostty-live-state.json"
 
 
 def applescript_escape(value: str) -> str:
@@ -79,26 +80,36 @@ def describe_entry(entry: dict, index: int) -> str:
     return f"  {index}. [{tool}] {cwd}  ({mode}){flags_text}"
 
 
-def load_sessions(auto: bool) -> list[dict]:
-    if not RESTORE_FILE.exists():
+def load_sessions(auto: bool) -> tuple[list[dict], Path | None]:
+    candidates: list[Path] = []
+    if RESTORE_FILE.exists():
+        candidates.append(RESTORE_FILE)
+    if LIVE_STATE_FILE.exists():
+        candidates.append(LIVE_STATE_FILE)
+
+    if not candidates:
         if not auto:
             print("No saved sessions to restore.")
-        return []
+        return [], None
 
-    sessions = load_restore_file(RESTORE_FILE)
-    if not sessions:
-        if not auto:
-            print("No valid sessions.")
-        return []
+    for source in candidates:
+        sessions = load_restore_file(source)
+        if not sessions:
+            continue
 
-    filtered = []
-    for entry in sessions:
-        cwd = entry["cwd"]
-        if Path(cwd).is_dir():
-            filtered.append(entry)
-        elif not auto:
-            print(f"  Skipping - {cwd} gone")
-    return filtered
+        filtered = []
+        for entry in sessions:
+            cwd = entry["cwd"]
+            if Path(cwd).is_dir():
+                filtered.append(entry)
+            elif not auto:
+                print(f"  Skipping - {cwd} gone")
+        if filtered:
+            return filtered, source
+
+    if not auto:
+        print("No valid sessions.")
+    return [], None
 
 
 def auto_output_first_session(entry: dict) -> None:
@@ -131,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    sessions = load_sessions(args.auto)
+    sessions, _ = load_sessions(args.auto)
     if not sessions:
         return 0
 
@@ -174,6 +185,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         try:
             RESTORE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            LIVE_STATE_FILE.unlink(missing_ok=True)
         except OSError:
             pass
 

@@ -18,12 +18,14 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from session_restore_core import (  # noqa: E402
     codex_is_interactive,
+    load_restore_file,
     resolve_codex_session_id_for_pid,
     resolve_sessions,
 )
 
 SNAPSHOT_PATH = Path("/tmp/ghostty-session-snapshot.json")
 RESTORE_PATH = Path.home() / ".claude" / "ghostty-restore.json"
+LIVE_STATE_PATH = Path.home() / ".claude" / "ghostty-live-state.json"
 CLAUDE_PROJECTS_PATH = Path.home() / ".claude" / "projects"
 LOG_PATH = Path.home() / ".claude" / "debug" / "ghostty-session-watcher.log"
 
@@ -154,6 +156,13 @@ def write_snapshot(entries: list[dict]) -> None:
     SNAPSHOT_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
 
+def write_json_atomic(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def load_snapshot() -> list[dict]:
     try:
         return json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
@@ -161,21 +170,38 @@ def load_snapshot() -> list[dict]:
         return []
 
 
-def save_sessions() -> tuple[int, int, int]:
-    snapshot = load_snapshot()
-    if not snapshot:
-        return (0, 0, 0)
+def load_sessions_file(path: Path) -> list[dict]:
+    return load_restore_file(path)
 
-    sessions = resolve_sessions(snapshot, str(CLAUDE_PROJECTS_PATH))
+
+def persist_live_state(entries: list[dict]) -> int:
+    sessions = resolve_sessions(entries, str(CLAUDE_PROJECTS_PATH))
+    write_json_atomic(LIVE_STATE_PATH, sessions)
+    return len(sessions)
+
+
+def save_sessions() -> tuple[int, int, int]:
+    sessions = load_sessions_file(LIVE_STATE_PATH)
+    if not sessions:
+        snapshot = load_snapshot()
+        if not snapshot:
+            return (0, 0, 0)
+        sessions = resolve_sessions(snapshot, str(CLAUDE_PROJECTS_PATH))
     if not sessions:
         return (0, 0, 0)
 
-    RESTORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RESTORE_PATH.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+    write_json_atomic(RESTORE_PATH, sessions)
 
     resumed = sum(1 for x in sessions if x.get("sessionId"))
     continued = len(sessions) - resumed
     return (len(sessions), resumed, continued)
+
+
+def should_save_on_shutdown() -> bool:
+    if is_ghostty_running():
+        return True
+    snapshot = load_snapshot()
+    return bool(snapshot)
 
 
 def main() -> int:
@@ -195,6 +221,7 @@ def main() -> int:
             if signature != prev_signature:
                 prev_signature = signature
                 write_snapshot(entries)
+                persist_live_state(entries)
                 unresolved_codex = sum(
                     1
                     for entry in entries
@@ -228,6 +255,17 @@ def main() -> int:
         time.sleep(2)
 
     log("Shutting down")
+    # Best-effort: persist latest sessions if this process likely observed active state.
+    if should_save_on_shutdown():
+        try:
+            total, resumed, continued = save_sessions()
+            if total:
+                log(
+                    f"Shutdown save: {total} total "
+                    f"({resumed} resume, {continued} continue)"
+                )
+        except Exception:
+            pass
     try:
         SNAPSHOT_PATH.unlink(missing_ok=True)
     except OSError:
