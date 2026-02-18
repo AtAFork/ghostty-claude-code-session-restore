@@ -76,6 +76,24 @@ class WatcherBehaviorTests(unittest.TestCase):
             restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
             self.assertEqual(restored, live_payload)
 
+    def test_snapshot_log_message_throttles_unresolved_codex_note(self) -> None:
+        watcher = load_watcher_module()
+
+        entries = [
+            {"pid": 10, "tool": "claude", "sessionId": "a"},
+            {"pid": 22, "tool": "codex", "sessionId": None},
+            {"pid": 33, "tool": "codex", "sessionId": "b"},
+        ]
+
+        first_message, unresolved = watcher.snapshot_log_message(entries, tuple())
+        self.assertIn("Snapshot: 3 session(s)", first_message)
+        self.assertIn("1 codex unresolved", first_message)
+        self.assertEqual(unresolved, (22,))
+
+        second_message, unresolved_again = watcher.snapshot_log_message(entries, unresolved)
+        self.assertEqual(second_message, "Snapshot: 3 session(s)")
+        self.assertEqual(unresolved_again, (22,))
+
 
 if __name__ == "__main__":
     unittest.main()

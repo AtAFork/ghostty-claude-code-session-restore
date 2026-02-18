@@ -204,11 +204,31 @@ def should_save_on_shutdown() -> bool:
     return bool(snapshot)
 
 
+def snapshot_log_message(
+    entries: list[dict], prev_unresolved_codex_pids: tuple[int, ...]
+) -> tuple[str, tuple[int, ...]]:
+    unresolved_codex_pids = tuple(
+        sorted(
+            entry["pid"]
+            for entry in entries
+            if entry.get("tool") == "codex" and not entry.get("sessionId")
+        )
+    )
+    base = f"Snapshot: {len(entries)} session(s)"
+    if unresolved_codex_pids and unresolved_codex_pids != prev_unresolved_codex_pids:
+        return (
+            f"{base} ({len(unresolved_codex_pids)} codex unresolved -> --last fallback)",
+            unresolved_codex_pids,
+        )
+    return base, unresolved_codex_pids
+
+
 def main() -> int:
     log(f"Started (PID {os.getpid()})")
 
     ghostty_was_running = False
     prev_signature: tuple = tuple()
+    prev_unresolved_codex_pids: tuple[int, ...] = tuple()
     n = 0
 
     while RUNNING:
@@ -222,18 +242,10 @@ def main() -> int:
                 prev_signature = signature
                 write_snapshot(entries)
                 persist_live_state(entries)
-                unresolved_codex = sum(
-                    1
-                    for entry in entries
-                    if entry.get("tool") == "codex" and not entry.get("sessionId")
+                message, prev_unresolved_codex_pids = snapshot_log_message(
+                    entries, prev_unresolved_codex_pids
                 )
-                if unresolved_codex:
-                    log(
-                        f"Snapshot: {len(entries)} session(s) "
-                        f"({unresolved_codex} codex unresolved -> --last fallback)"
-                    )
-                else:
-                    log(f"Snapshot: {len(entries)} session(s)")
+                log(message)
         elif ghostty_was_running:
             log("Ghostty quit - saving")
             total, resumed, continued = save_sessions()
@@ -246,6 +258,7 @@ def main() -> int:
                 log("No sessions to save")
             ghostty_was_running = False
             prev_signature = tuple()
+            prev_unresolved_codex_pids = tuple()
             write_snapshot([])
 
         n = (n + 1) % 500

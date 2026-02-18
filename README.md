@@ -184,6 +184,69 @@ PY
 fi
 ```
 
+If you use Fish, add this to `~/.config/fish/config.fish`:
+
+```fish
+# Auto-restore Claude/Codex sessions in Ghostty (Fish)
+if test "$TERM_PROGRAM" = "ghostty"; and test -f "$HOME/.claude/ghostty-restore.json"
+    if mkdir "$HOME/.claude/.ghostty-restore-lock" 2>/dev/null
+        set _restore_first_json ($HOME/.local/bin/ghostty-restore --auto 2>/dev/null)
+        rmdir "$HOME/.claude/.ghostty-restore-lock" 2>/dev/null
+
+        if test -n "$_restore_first_json"
+            set _restore_parts (
+                env RESTORE_FIRST_JSON="$_restore_first_json" python3 - <<'PY' | string split0
+import json
+import os
+import sys
+
+try:
+    entry = json.loads(os.environ.get("RESTORE_FIRST_JSON", ""))
+except Exception:
+    raise SystemExit(0)
+
+tool = str(entry.get("tool") or "claude")
+sid = str(entry.get("sessionId") or "")
+cwd = str(entry.get("cwd") or "")
+flags = entry.get("flags")
+if not isinstance(flags, list):
+    flags = []
+
+for value in [tool, sid, cwd, *[x for x in flags if isinstance(x, str)]]:
+    sys.stdout.buffer.write(value.encode("utf-8", "ignore"))
+    sys.stdout.buffer.write(b"\0")
+PY
+            )
+
+            if test (count $_restore_parts) -ge 3
+                set _r_tool $_restore_parts[1]
+                set _r_sid $_restore_parts[2]
+                set _r_cwd $_restore_parts[3]
+                set _r_flags $_restore_parts[4..-1]
+
+                cd "$_r_cwd" 2>/dev/null
+
+                if test "$_r_tool" = "codex"
+                    if test -n "$_r_sid"
+                        codex resume "$_r_sid" $_r_flags
+                    else
+                        codex resume --last $_r_flags
+                    end
+                else
+                    if test -n "$_r_sid"
+                        claude --resume "$_r_sid" $_r_flags
+                    else
+                        claude --continue $_r_flags
+                    end
+                end
+            end
+        end
+
+        set -e _restore_first_json _restore_parts _r_tool _r_sid _r_cwd _r_flags
+    end
+end
+```
+
 ### 6. Start the watcher
 
 ```bash
