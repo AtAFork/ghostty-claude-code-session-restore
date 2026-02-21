@@ -28,6 +28,7 @@ RESTORE_PATH = Path.home() / ".claude" / "ghostty-restore.json"
 LIVE_STATE_PATH = Path.home() / ".claude" / "ghostty-live-state.json"
 CLAUDE_PROJECTS_PATH = Path.home() / ".claude" / "projects"
 LOG_PATH = Path.home() / ".claude" / "debug" / "ghostty-session-watcher.log"
+EMPTY_LIVE_STATE_GRACE_SECONDS = 8.0
 
 RUNNING = True
 
@@ -208,6 +209,18 @@ def should_save_on_shutdown() -> bool:
     return bool(snapshot)
 
 
+def should_clear_live_state_for_empty_period(
+    *,
+    empty_started_at: float | None,
+    now: float,
+    already_cleared: bool,
+    grace_seconds: float = EMPTY_LIVE_STATE_GRACE_SECONDS,
+) -> bool:
+    if already_cleared or empty_started_at is None:
+        return False
+    return (now - empty_started_at) >= grace_seconds
+
+
 def snapshot_log_message(
     entries: list[dict], prev_unresolved_codex_pids: tuple[int, ...]
 ) -> tuple[str, tuple[int, ...]]:
@@ -233,12 +246,30 @@ def main() -> int:
     ghostty_was_running = False
     prev_signature: tuple = tuple()
     prev_unresolved_codex_pids: tuple[int, ...] = tuple()
+    empty_started_at: float | None = None
+    empty_live_state_cleared = False
     n = 0
 
     while RUNNING:
         if is_ghostty_running():
             ghostty_was_running = True
             entries = list_candidate_processes()
+            now = time.monotonic()
+            if entries:
+                empty_started_at = None
+                empty_live_state_cleared = False
+            else:
+                if empty_started_at is None:
+                    empty_started_at = now
+                if should_clear_live_state_for_empty_period(
+                    empty_started_at=empty_started_at,
+                    now=now,
+                    already_cleared=empty_live_state_cleared,
+                ):
+                    write_json_atomic(LIVE_STATE_PATH, [])
+                    empty_live_state_cleared = True
+                    log("No active sessions for 8s - cleared live state")
+
             signature = tuple(
                 (entry["pid"], entry.get("sessionId"), entry["args"]) for entry in entries
             )
@@ -263,6 +294,8 @@ def main() -> int:
             ghostty_was_running = False
             prev_signature = tuple()
             prev_unresolved_codex_pids = tuple()
+            empty_started_at = None
+            empty_live_state_cleared = False
             write_snapshot([])
 
         n = (n + 1) % 500

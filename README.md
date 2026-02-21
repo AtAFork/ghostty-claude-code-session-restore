@@ -260,6 +260,21 @@ launchctl print gui/$(id -u)/com.user.ghostty-session-watcher | head -5
 cat ~/.claude/debug/ghostty-session-watcher.log
 ```
 
+## Resource Usage
+
+The watcher is intentionally lightweight:
+
+- Loop interval: every 2 seconds
+- CPU: usually near idle between polls
+- Memory: single Python process, typically low tens of MB
+- Disk writes: small JSON snapshots/state files only on session-state changes
+
+You can inspect active usage with:
+
+```bash
+ps -o pid,pcpu,pmem,rss,command -p "$(pgrep -f ghostty-session-watcher | head -1)"
+```
+
 ## Runtime Files
 
 ```text
@@ -334,11 +349,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.ghostty-session
 
 ### Sessions are missing
 
-- Confirm Ghostty ancestry filtering is expected for your workflow.
+- Verify the CLI process was launched from Ghostty (the watcher only captures
+  processes whose parent chain contains `ghostty`).
 - Check current snapshot:
 
 ```bash
 cat /tmp/ghostty-session-snapshot.json | python3 -m json.tool
+# Optional: inspect process ancestry for a running session
+ps -o pid,ppid,command -p <CLAUDE_OR_CODEX_PID>
 ```
 
 ### Restore opens wrong Claude thread for unresolved sessions

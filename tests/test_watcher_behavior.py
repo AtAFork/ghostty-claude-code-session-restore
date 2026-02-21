@@ -102,6 +102,39 @@ class WatcherBehaviorTests(unittest.TestCase):
             after = json.loads(watcher.LIVE_STATE_PATH.read_text(encoding="utf-8"))
             self.assertEqual(after, existing_payload)
 
+    def test_should_clear_live_state_for_empty_period(self) -> None:
+        watcher = load_watcher_module()
+        grace = watcher.EMPTY_LIVE_STATE_GRACE_SECONDS
+
+        self.assertFalse(
+            watcher.should_clear_live_state_for_empty_period(
+                empty_started_at=None,
+                now=100.0,
+                already_cleared=False,
+            )
+        )
+        self.assertFalse(
+            watcher.should_clear_live_state_for_empty_period(
+                empty_started_at=100.0,
+                now=100.0 + grace - 0.1,
+                already_cleared=False,
+            )
+        )
+        self.assertTrue(
+            watcher.should_clear_live_state_for_empty_period(
+                empty_started_at=100.0,
+                now=100.0 + grace,
+                already_cleared=False,
+            )
+        )
+        self.assertFalse(
+            watcher.should_clear_live_state_for_empty_period(
+                empty_started_at=100.0,
+                now=100.0 + grace + 5.0,
+                already_cleared=True,
+            )
+        )
+
     def test_snapshot_log_message_throttles_unresolved_codex_note(self) -> None:
         watcher = load_watcher_module()
 
