@@ -172,6 +172,159 @@ class RestoreAutoTests(unittest.TestCase):
             self.assertEqual(out["tool"], "codex")
             self.assertEqual(out["cwd"], str(cwd))
 
+    def test_auto_mode_preserves_cmux_entries_on_success(self) -> None:
+        """Ghostty auto-restore must not delete pending cmux sessions from restore file."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            restore_dir = home / ".claude"
+            restore_dir.mkdir(parents=True, exist_ok=True)
+            cwd = home / "project"
+            cwd.mkdir(parents=True, exist_ok=True)
+
+            ghostty_session = {
+                "tool": "claude",
+                "sessionId": "aaa-bbb-ccc",
+                "cwd": str(cwd),
+                "flags": [],
+            }
+            cmux_session = {
+                "tool": "claude",
+                "sessionId": "xxx-yyy-zzz",
+                "cwd": str(cwd),
+                "flags": [],
+                "terminal": "cmux",
+                "workspaceName": "dev",
+                "workspaceId": "ws-1",
+                "surfaceId": "sf-1",
+                "surfaceIndex": 0,
+            }
+            restore_path = restore_dir / "ghostty-restore.json"
+            restore_path.write_text(
+                json.dumps([ghostty_session, cmux_session]), encoding="utf-8"
+            )
+
+            proc = self.run_restore_auto(home)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["sessionId"], "aaa-bbb-ccc")
+
+            # Cmux session must survive in restore file
+            self.assertTrue(restore_path.exists(), "restore file should still exist")
+            remaining = json.loads(restore_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["terminal"], "cmux")
+            self.assertEqual(remaining[0]["sessionId"], "xxx-yyy-zzz")
+
+    def test_auto_mode_does_not_replay_ghostty_from_live_state_after_preserve(self) -> None:
+        """After preserving cmux entries, stale ghostty entries must not be replayed."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            cwd = home / "project"
+            cwd.mkdir(parents=True, exist_ok=True)
+
+            ghostty_session = {
+                "tool": "claude",
+                "sessionId": "ghostty-1",
+                "cwd": str(cwd),
+                "flags": [],
+            }
+            cmux_session = {
+                "tool": "claude",
+                "sessionId": "cmux-1",
+                "cwd": str(cwd),
+                "flags": [],
+                "terminal": "cmux",
+                "workspaceName": "dev",
+                "workspaceId": "ws-1",
+                "surfaceId": "sf-1",
+                "surfaceIndex": 0,
+            }
+
+            (claude_dir / "ghostty-restore.json").write_text(
+                json.dumps([ghostty_session, cmux_session]), encoding="utf-8"
+            )
+            (claude_dir / "ghostty-live-state.json").write_text(
+                json.dumps([ghostty_session, cmux_session]), encoding="utf-8"
+            )
+
+            first = self.run_restore_auto(home)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_out = json.loads(first.stdout)
+            self.assertEqual(first_out["sessionId"], "ghostty-1")
+
+            second = self.run_restore_auto(home)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(second.stdout.strip(), "")
+
+            remaining = json.loads(
+                (claude_dir / "ghostty-restore.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0].get("terminal"), "cmux")
+
+    def test_auto_mode_partial_failure_dedupes_cmux_pending(self) -> None:
+        """Partial ghostty restore should not duplicate cmux pending entries from both files."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            home = Path(tempdir)
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            cwd = home / "project"
+            cwd.mkdir(parents=True, exist_ok=True)
+
+            ghostty_one = {
+                "tool": "claude",
+                "sessionId": "ghostty-1",
+                "cwd": str(cwd),
+                "flags": [],
+            }
+            ghostty_two = {
+                "tool": "codex",
+                "sessionId": "ghostty-2",
+                "cwd": str(cwd),
+                "flags": [],
+            }
+            cmux_session = {
+                "tool": "claude",
+                "sessionId": "cmux-1",
+                "cwd": str(cwd),
+                "flags": [],
+                "terminal": "cmux",
+                "workspaceName": "dev",
+                "workspaceId": "ws-1",
+                "surfaceId": "sf-1",
+                "surfaceIndex": 0,
+            }
+
+            (claude_dir / "ghostty-restore.json").write_text(
+                json.dumps([ghostty_one, ghostty_two, cmux_session]), encoding="utf-8"
+            )
+            (claude_dir / "ghostty-live-state.json").write_text(
+                json.dumps([ghostty_one, ghostty_two, cmux_session]), encoding="utf-8"
+            )
+
+            fake_bin = home / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            fake_osascript = fake_bin / "osascript"
+            fake_osascript.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_osascript.chmod(0o755)
+
+            proc = self.run_restore_auto(
+                home, {"PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            remaining = json.loads(
+                (claude_dir / "ghostty-restore.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(remaining), 2)
+            self.assertEqual(
+                sorted((s.get("terminal", "ghostty"), s.get("sessionId")) for s in remaining),
+                [("cmux", "cmux-1"), ("ghostty", "ghostty-2")],
+            )
+
     def test_auto_mode_preserves_unlaunched_sessions_when_osascript_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)

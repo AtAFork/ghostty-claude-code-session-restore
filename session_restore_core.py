@@ -15,6 +15,7 @@ UUID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE,
 )
+SCHEMA_VERSION = 1
 
 CODEX_INTERACTIVE_SUBCOMMANDS = {"resume", "fork"}
 CODEX_NON_INTERACTIVE_SUBCOMMANDS = {
@@ -227,74 +228,6 @@ def extract_codex_flags(args: str) -> List[str]:
     )
 
 
-def find_claude_project_dir(cwd: str, projects_dir: str) -> str | None:
-    """Find matching Claude project directory for cwd, trying parent directories."""
-    path = Path(cwd)
-    projects_root = Path(projects_dir)
-
-    while True:
-        encoded = str(path).replace("/", "-")
-        candidate = projects_root / encoded
-        if candidate.is_dir():
-            return str(candidate)
-        if path == Path("/"):
-            return None
-        path = path.parent
-
-
-def is_real_claude_session(filepath: str, max_lines: int = 25) -> bool:
-    """True if the session file contains at least one user message."""
-    try:
-        with open(filepath, encoding="utf-8") as handle:
-            for idx, line in enumerate(handle):
-                if idx >= max_lines:
-                    break
-                try:
-                    entry = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    continue
-                if entry.get("type") == "user":
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def get_recent_real_claude_sessions(
-    project_dir: str, count: int, claimed_ids: set[str]
-) -> list[str]:
-    if count <= 0:
-        return []
-
-    candidates = []
-    try:
-        names = os.listdir(project_dir)
-    except OSError:
-        return []
-
-    for name in names:
-        if not name.endswith(".jsonl") or name == "sessions-index.json":
-            continue
-        sid = name.removesuffix(".jsonl")
-        if sid in claimed_ids:
-            continue
-        path = os.path.join(project_dir, name)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            continue
-        candidates.append((mtime, sid, path))
-
-    candidates.sort(reverse=True)
-    out: list[str] = []
-    for _, sid, path in candidates:
-        if len(out) >= count:
-            break
-        if is_real_claude_session(path):
-            out.append(sid)
-    return out
-
-
 def extract_codex_session_id_from_lsof_text(text: str) -> str | None:
     """Extract codex session UUID from open rollout paths in lsof output."""
     for line in text.splitlines():
@@ -302,6 +235,19 @@ def extract_codex_session_id_from_lsof_text(text: str) -> str | None:
             r"/\.codex/(?:sessions/\d{4}/\d{2}/\d{2}|archived_sessions)/"
             r"rollout-[^-\s]+-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-"
             r"([0-9a-f-]{36})\.jsonl",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match and _looks_like_uuid(match.group(1)):
+            return match.group(1)
+    return None
+
+
+def extract_claude_session_id_from_lsof_text(text: str) -> str | None:
+    """Extract claude session UUID from open project session paths in lsof output."""
+    for line in text.splitlines():
+        match = re.search(
+            r"/\.claude/projects/[^/\s]+/([0-9a-f-]{36})\.jsonl",
             line,
             flags=re.IGNORECASE,
         )
@@ -326,6 +272,22 @@ def resolve_codex_session_id_for_pid(pid: int) -> str | None:
     return extract_codex_session_id_from_lsof_text(proc.stdout)
 
 
+def resolve_claude_session_id_for_pid(pid: int) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["lsof", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return extract_claude_session_id_from_lsof_text(proc.stdout)
+
+
 def normalize_flags(flags: object) -> List[str]:
     if isinstance(flags, list):
         out = []
@@ -342,17 +304,34 @@ def normalize_restore_entry(entry: dict) -> dict:
     tool = str(entry.get("tool") or "claude").strip().lower()
     if tool not in {"claude", "codex"}:
         tool = "claude"
-    return {
+    result = {
         "tool": tool,
         "sessionId": entry.get("sessionId") or None,
         "cwd": str(entry.get("cwd") or ""),
         "flags": normalize_flags(entry.get("flags")),
     }
+    # Pass through cmux metadata when present
+    if entry.get("terminal"):
+        result["terminal"] = entry["terminal"]
+    if entry.get("workspaceName"):
+        result["workspaceName"] = entry["workspaceName"]
+    if entry.get("workspaceId"):
+        result["workspaceId"] = entry["workspaceId"]
+    if entry.get("surfaceId"):
+        result["surfaceId"] = entry["surfaceId"]
+    if "surfaceIndex" in entry:
+        try:
+            idx = int(entry["surfaceIndex"])
+        except (TypeError, ValueError):
+            idx = 0
+        if idx < 0:
+            idx = 0
+        result["surfaceIndex"] = idx
+    return result
 
 
-def resolve_sessions(snapshot: list[dict], claude_projects_dir: str) -> list[dict]:
+def resolve_sessions(snapshot: list[dict]) -> list[dict]:
     sessions = []
-    claimed_claude_ids: set[str] = set()
 
     for raw in snapshot:
         tool = str(raw.get("tool") or "").strip().lower()
@@ -368,38 +347,30 @@ def resolve_sessions(snapshot: list[dict], claude_projects_dir: str) -> list[dic
         if tool == "claude":
             sid = raw.get("sessionId") or extract_claude_resume_id(args)
             flags = extract_claude_flags(args)
-            if sid:
-                claimed_claude_ids.add(sid)
         else:
             sid = raw.get("sessionId") or extract_codex_resume_id(args)
             flags = extract_codex_flags(args)
 
-        sessions.append(
-            {
-                "tool": tool,
-                "sessionId": sid if sid else None,
-                "cwd": str(raw.get("cwd") or ""),
-                "flags": flags,
-            }
-        )
-
-    # Resolve unresolved Claude sessions by project directory session history.
-    grouped: dict[str, list[dict]] = {}
-    for session in sessions:
-        if session["tool"] != "claude" or session.get("sessionId"):
-            continue
-        project_dir = find_claude_project_dir(session["cwd"], claude_projects_dir)
-        if project_dir:
-            grouped.setdefault(project_dir, []).append(session)
-
-    for project_dir, entries in grouped.items():
-        found = get_recent_real_claude_sessions(
-            project_dir, len(entries), claimed_claude_ids
-        )
-        for idx, session in enumerate(entries):
-            if idx < len(found):
-                session["sessionId"] = found[idx]
-                claimed_claude_ids.add(found[idx])
+        session_dict: dict = {
+            "tool": tool,
+            "sessionId": sid if sid else None,
+            "cwd": str(raw.get("cwd") or ""),
+            "flags": flags,
+        }
+        # Copy through cmux metadata from raw snapshot entries
+        if raw.get("workspaceId"):
+            session_dict["terminal"] = "cmux"
+        elif raw.get("terminal"):
+            session_dict["terminal"] = raw["terminal"]
+        if raw.get("workspaceName"):
+            session_dict["workspaceName"] = raw["workspaceName"]
+        if raw.get("workspaceId"):
+            session_dict["workspaceId"] = raw["workspaceId"]
+        if raw.get("surfaceId"):
+            session_dict["surfaceId"] = raw["surfaceId"]
+        if "surfaceIndex" in raw:
+            session_dict["surfaceIndex"] = raw["surfaceIndex"]
+        sessions.append(session_dict)
 
     return sessions
 
@@ -413,7 +384,7 @@ def build_restore_argv(session: dict) -> list[str]:
     if tool == "codex":
         if sid:
             return ["codex", "resume", sid, *flags]
-        return ["codex", "resume", "--last", *flags]
+        return ["codex", *flags]
 
     if sid:
         return ["claude", "--resume", sid, *flags]
@@ -439,6 +410,12 @@ def load_restore_file(path: Path) -> list[dict]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
+    if isinstance(raw, dict):
+        version = raw.get("version")
+        sessions = raw.get("sessions")
+        if version != SCHEMA_VERSION or not isinstance(sessions, list):
+            return []
+        raw = sessions
     if not isinstance(raw, list):
         return []
     out = []
@@ -448,4 +425,3 @@ def load_restore_file(path: Path) -> list[dict]:
             if normalized["cwd"]:
                 out.append(normalized)
     return out
-

@@ -1,6 +1,6 @@
 # Ghostty Session Manager
 
-Save and restore Ghostty tabs running Claude Code or Codex across Ghostty restarts and reboots.
+Save and restore Ghostty/Cmux tabs running Claude Code or Codex across terminal restarts and reboots.
 
 ## Problem
 
@@ -64,7 +64,7 @@ Only processes with a Ghostty ancestor in their PPID chain are captured. This ex
 
 1. Prefer session ID extracted from open rollout file (`~/.codex/sessions/.../rollout-...-<uuid>.jsonl`) while the process is alive.
 2. Otherwise use `codex resume <id>` if present in args.
-3. Fallback to `codex resume --last`.
+3. Fallback to `codex` (start a new session in the same cwd with the same flags).
 
 ### Restore Behavior
 
@@ -73,7 +73,7 @@ For each saved session:
 - `tool=claude` + `sessionId` -> `claude --resume <id> ...flags`
 - `tool=claude` + no `sessionId` -> `claude --continue ...flags`
 - `tool=codex` + `sessionId` -> `codex resume <id> ...flags`
-- `tool=codex` + no `sessionId` -> `codex resume --last ...flags`
+- `tool=codex` + no `sessionId` -> `codex ...flags`
 
 ## Prerequisites
 
@@ -167,7 +167,7 @@ PY
           if [[ -n "$_r_sid" ]]; then
             codex resume "$_r_sid" "${_r_flags[@]}"
           else
-            codex resume --last "${_r_flags[@]}"
+            codex "${_r_flags[@]}"
           fi
         else
           if [[ -n "$_r_sid" ]]; then
@@ -230,7 +230,7 @@ PY
                     if test -n "$_r_sid"
                         codex resume "$_r_sid" $_r_flags
                     else
-                        codex resume --last $_r_flags
+                        codex $_r_flags
                     end
                 else
                     if test -n "$_r_sid"
@@ -247,9 +247,10 @@ PY
 end
 ```
 
-### 6. Start the watcher
+### 6. Start (or restart) the watcher
 
 ```bash
+launchctl bootout gui/$(id -u)/com.user.ghostty-session-watcher 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 ```
 
@@ -365,7 +366,7 @@ This can happen only for Claude sessions without a known `sessionId`; fallback i
 
 ### Codex fallback picks the wrong thread
 
-If no Codex `sessionId` is available, fallback is `codex resume --last`.
+If no Codex `sessionId` is available, fallback is `codex` (new session).
 
 ### Watcher not starting
 
@@ -374,6 +375,83 @@ launchctl print gui/$(id -u)/com.user.ghostty-session-watcher
 cat ~/.claude/debug/ghostty-session-watcher-stderr.log
 plutil -lint ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 ```
+
+## Cmux Support
+
+[Cmux](https://cmux.dev) is a native macOS terminal wrapping Ghostty's libghostty with workspace management. The session manager auto-detects Cmux and handles snapshotting and restoring sessions across Cmux restarts.
+
+### How It Works with Cmux
+
+- **Auto-detection**: The watcher detects Cmux by checking if `/tmp/cmux.sock` is alive. If connected, it uses Cmux mode; otherwise it falls back to standard Ghostty mode.
+- **Shell startup snippet required**: A small snippet in your shell config keeps the workspace map fresh and triggers restore on Cmux restart. The watcher (launchd agent) cannot call the `cmux` CLI directly due to Cmux's access control — only processes started inside Cmux can use it.
+- **Workspace name matching**: Cmux UUIDs change across restarts, but workspace names persist. Sessions are matched to workspaces by name.
+- **Surface index matching**: When a workspace has multiple surfaces (splits), sessions are matched by surface index within the workspace.
+
+### Cmux Shell Startup Snippet
+
+Add this to your shell startup file (`~/.bashrc`, `~/.bash_profile`, or `~/.zshrc`):
+
+```bash
+# Ghostty Session Manager — Cmux support
+if [[ -n "$CMUX_WORKSPACE_ID" ]]; then
+  # Keep workspace UUID -> name map fresh for the watcher
+  "$HOME/.local/bin/ghostty-restore" --update-cmux-map 2>/dev/null &
+
+  # Auto-restore saved cmux sessions (once per Cmux restart)
+  if [[ -f "$HOME/.claude/ghostty-restore.json" ]]; then
+    if mkdir "$HOME/.claude/.ghostty-cmux-restore-lock" 2>/dev/null; then
+      "$HOME/.local/bin/ghostty-restore" --auto-cmux 2>/dev/null
+      rmdir "$HOME/.claude/.ghostty-cmux-restore-lock" 2>/dev/null
+    fi
+  fi
+fi
+```
+
+If you use Fish, add this to `~/.config/fish/config.fish`:
+
+```fish
+# Ghostty Session Manager — Cmux support (Fish)
+if test -n "$CMUX_WORKSPACE_ID"
+    $HOME/.local/bin/ghostty-restore --update-cmux-map 2>/dev/null &
+    if test -f "$HOME/.claude/ghostty-restore.json"
+        if mkdir "$HOME/.claude/.ghostty-cmux-restore-lock" 2>/dev/null
+            $HOME/.local/bin/ghostty-restore --auto-cmux 2>/dev/null
+            rmdir "$HOME/.claude/.ghostty-cmux-restore-lock" 2>/dev/null
+        end
+    end
+end
+```
+
+### Cmux-Specific Data
+
+Each session entry includes additional fields when running under Cmux:
+
+```json
+{
+  "tool": "claude",
+  "sessionId": "904135b4-...",
+  "cwd": "/Users/you/project",
+  "flags": ["--model", "sonnet"],
+  "terminal": "cmux",
+  "workspaceName": "my-project",
+  "surfaceIndex": 0
+}
+```
+
+### Manual Cmux Restore
+
+```bash
+# From within a Cmux terminal
+ghostty-restore
+```
+
+This shows saved cmux sessions with workspace names and surface indices, then sends commands to matching workspaces.
+
+### Cmux Troubleshooting
+
+- **Workspace name must match**: If you renamed a workspace after the session was saved, restore won't find it. Use the same workspace names.
+- **Cmux must be running**: Restore must be run from within a Cmux terminal (the `cmux` CLI only works from inside Cmux).
+- **Surface count must match**: If the workspace had 2 surfaces when saved but only 1 after restart, the second session is skipped.
 
 ## Limitations
 
@@ -387,6 +465,7 @@ plutil -lint ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 launchctl bootout gui/$(id -u)/com.user.ghostty-session-watcher
 rm ~/Library/LaunchAgents/com.user.ghostty-session-watcher.plist
 rm ~/.local/bin/ghostty-session-watcher ~/.local/bin/ghostty-restore
-rm -f ~/.claude/ghostty-restore.json /tmp/ghostty-session-snapshot.json
-rmdir ~/.claude/.ghostty-restore-lock 2>/dev/null
+rm -f ~/.claude/ghostty-restore.json ~/.claude/ghostty-live-state.json
+rm -f ~/.claude/cmux-workspace-map.json /tmp/ghostty-session-snapshot.json
+rmdir ~/.claude/.ghostty-restore-lock ~/.claude/.ghostty-cmux-restore-lock 2>/dev/null
 ```

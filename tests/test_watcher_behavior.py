@@ -30,13 +30,15 @@ class WatcherBehaviorTests(unittest.TestCase):
         with mock.patch.object(watcher, "is_ghostty_running", return_value=True):
             self.assertTrue(watcher.should_save_on_shutdown())
 
-        with mock.patch.object(watcher, "is_ghostty_running", return_value=False):
-            with mock.patch.object(watcher, "load_snapshot", return_value=[]):
-                self.assertFalse(watcher.should_save_on_shutdown())
+        with mock.patch.object(watcher, "_is_cmux_socket_alive", return_value=False):
+            with mock.patch.object(watcher, "is_ghostty_running", return_value=False):
+                with mock.patch.object(watcher, "load_snapshot", return_value=[]):
+                    self.assertFalse(watcher.should_save_on_shutdown())
 
-        with mock.patch.object(watcher, "is_ghostty_running", return_value=False):
-            with mock.patch.object(watcher, "load_snapshot", return_value=[{"pid": 1}]):
-                self.assertTrue(watcher.should_save_on_shutdown())
+        with mock.patch.object(watcher, "_is_cmux_socket_alive", return_value=False):
+            with mock.patch.object(watcher, "is_ghostty_running", return_value=False):
+                with mock.patch.object(watcher, "load_snapshot", return_value=[{"pid": 1}]):
+                    self.assertTrue(watcher.should_save_on_shutdown())
 
     def test_save_sessions_prefers_live_state(self) -> None:
         watcher = load_watcher_module()
@@ -75,6 +77,281 @@ class WatcherBehaviorTests(unittest.TestCase):
 
             restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
             self.assertEqual(restored, live_payload)
+
+    def test_save_sessions_filters_to_cmux_terminal(self) -> None:
+        watcher = load_watcher_module()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watcher.LIVE_STATE_PATH = root / "ghostty-live-state.json"
+            watcher.RESTORE_PATH = root / "ghostty-restore.json"
+            watcher.SNAPSHOT_PATH = root / "ghostty-snapshot.json"
+            watcher.CLAUDE_PROJECTS_PATH = root / "projects"
+
+            live_payload = [
+                {
+                    "tool": "claude",
+                    "sessionId": "cmux-sid",
+                    "cwd": "/tmp/cmux",
+                    "flags": [],
+                    "terminal": "cmux",
+                },
+                {
+                    "tool": "claude",
+                    "sessionId": "ghostty-sid",
+                    "cwd": "/tmp/ghostty",
+                    "flags": [],
+                },
+            ]
+            watcher.LIVE_STATE_PATH.write_text(
+                json.dumps(live_payload), encoding="utf-8"
+            )
+
+            total, resumed, continued = watcher.save_sessions(terminal="cmux")
+            self.assertEqual((total, resumed, continued), (1, 1, 0))
+
+            restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(restored[0]["terminal"], "cmux")
+
+    def test_save_sessions_filters_to_ghostty_terminal(self) -> None:
+        watcher = load_watcher_module()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watcher.LIVE_STATE_PATH = root / "ghostty-live-state.json"
+            watcher.RESTORE_PATH = root / "ghostty-restore.json"
+            watcher.SNAPSHOT_PATH = root / "ghostty-snapshot.json"
+            watcher.CLAUDE_PROJECTS_PATH = root / "projects"
+
+            live_payload = [
+                {
+                    "tool": "claude",
+                    "sessionId": "cmux-sid",
+                    "cwd": "/tmp/cmux",
+                    "flags": [],
+                    "terminal": "cmux",
+                },
+                {
+                    "tool": "claude",
+                    "sessionId": "ghostty-sid",
+                    "cwd": "/tmp/ghostty",
+                    "flags": [],
+                },
+            ]
+            watcher.LIVE_STATE_PATH.write_text(
+                json.dumps(live_payload), encoding="utf-8"
+            )
+
+            total, resumed, continued = watcher.save_sessions(terminal="ghostty")
+            self.assertEqual((total, resumed, continued), (1, 1, 0))
+
+            restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(len(restored), 1)
+            self.assertNotEqual(restored[0].get("terminal"), "cmux")
+
+    def test_save_sessions_terminal_save_preserves_other_terminal_entries(self) -> None:
+        watcher = load_watcher_module()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watcher.LIVE_STATE_PATH = root / "ghostty-live-state.json"
+            watcher.RESTORE_PATH = root / "ghostty-restore.json"
+            watcher.SNAPSHOT_PATH = root / "ghostty-snapshot.json"
+            watcher.CLAUDE_PROJECTS_PATH = root / "projects"
+
+            watcher.RESTORE_PATH.write_text(
+                json.dumps(
+                    [
+                        {
+                            "tool": "claude",
+                            "sessionId": "cmux-sid",
+                            "cwd": "/tmp/cmux-existing",
+                            "flags": [],
+                            "terminal": "cmux",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            watcher.LIVE_STATE_PATH.write_text(
+                json.dumps(
+                    [
+                        {
+                            "tool": "claude",
+                            "sessionId": "ghostty-sid",
+                            "cwd": "/tmp/ghostty-live",
+                            "flags": [],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            total, resumed, continued = watcher.save_sessions(terminal="ghostty")
+            self.assertEqual((total, resumed, continued), (1, 1, 0))
+
+            restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(len(restored), 2)
+            terminals = ["cmux" if r.get("terminal") == "cmux" else "ghostty" for r in restored]
+            self.assertEqual(sorted(terminals), ["cmux", "ghostty"])
+
+    def test_final_single_terminal_close_preserves_prior_terminal_save(self) -> None:
+        watcher = load_watcher_module()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watcher.LIVE_STATE_PATH = root / "ghostty-live-state.json"
+            watcher.RESTORE_PATH = root / "ghostty-restore.json"
+            watcher.SNAPSHOT_PATH = root / "ghostty-snapshot.json"
+            watcher.CLAUDE_PROJECTS_PATH = root / "projects"
+
+            # Initial mixed state while both terminals are active.
+            watcher.LIVE_STATE_PATH.write_text(
+                json.dumps(
+                    [
+                        {
+                            "tool": "claude",
+                            "sessionId": "cmux-sid",
+                            "cwd": "/tmp/cmux-live",
+                            "flags": [],
+                            "terminal": "cmux",
+                        },
+                        {
+                            "tool": "claude",
+                            "sessionId": "ghostty-sid",
+                            "cwd": "/tmp/ghostty-live",
+                            "flags": [],
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            # Cmux closes first while ghostty remains active.
+            total, resumed, continued = watcher.save_sessions(terminal="cmux")
+            self.assertEqual((total, resumed, continued), (1, 1, 0))
+
+            # Live state now reflects only ghostty, which is what the watcher
+            # sees right before the final close event.
+            watcher.LIVE_STATE_PATH.write_text(
+                json.dumps(
+                    [
+                        {
+                            "tool": "claude",
+                            "sessionId": "ghostty-sid",
+                            "cwd": "/tmp/ghostty-live",
+                            "flags": [],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            save_terminal = watcher.terminal_scope_for_final_save({"ghostty"})
+            self.assertEqual(save_terminal, "ghostty")
+            total, resumed, continued = watcher.save_sessions(terminal=save_terminal)
+            self.assertEqual((total, resumed, continued), (1, 1, 0))
+
+            restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
+            terminals = ["cmux" if r.get("terminal") == "cmux" else "ghostty" for r in restored]
+            self.assertEqual(sorted(terminals), ["cmux", "ghostty"])
+
+    def test_terminal_scope_for_final_save(self) -> None:
+        watcher = load_watcher_module()
+        self.assertEqual(watcher.terminal_scope_for_final_save({"cmux"}), "cmux")
+        self.assertEqual(watcher.terminal_scope_for_final_save({"ghostty"}), "ghostty")
+        self.assertIsNone(watcher.terminal_scope_for_final_save({"cmux", "ghostty"}))
+        self.assertIsNone(watcher.terminal_scope_for_final_save(set()))
+
+    def test_main_loop_sequential_terminal_shutdown_keeps_both_sessions(self) -> None:
+        watcher = load_watcher_module()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watcher.SNAPSHOT_PATH = root / "ghostty-snapshot.json"
+            watcher.LIVE_STATE_PATH = root / "ghostty-live-state.json"
+            watcher.RESTORE_PATH = root / "ghostty-restore.json"
+            watcher.LOG_PATH = root / "ghostty-session-watcher.log"
+            watcher.CLAUDE_PROJECTS_PATH = root / "projects"
+            watcher.RUNNING = True
+
+            state_sequence = [
+                {"cmux", "ghostty"},
+                {"ghostty"},
+                set(),
+            ]
+            sequence_iter = iter(state_sequence)
+
+            all_entries = [
+                {
+                    "pid": 101,
+                    "tty": "ttys001",
+                    "cwd": "/tmp/cmux",
+                    "args": "claude --resume cmux-sid",
+                    "tool": "claude",
+                    "sessionId": "cmux-sid",
+                    "workspaceId": "ws-1",
+                    "surfaceId": "sf-1",
+                    "workspaceName": "Main",
+                    "surfaceIndex": 0,
+                },
+                {
+                    "pid": 102,
+                    "tty": "ttys002",
+                    "cwd": "/tmp/ghostty",
+                    "args": "claude --resume ghostty-sid",
+                    "tool": "claude",
+                    "sessionId": "ghostty-sid",
+                },
+            ]
+            ghostty_only_entries = [
+                {
+                    "pid": 102,
+                    "tty": "ttys002",
+                    "cwd": "/tmp/ghostty",
+                    "args": "claude --resume ghostty-sid",
+                    "tool": "claude",
+                    "sessionId": "ghostty-sid",
+                }
+            ]
+
+            def fake_detect_terminals():
+                try:
+                    return next(sequence_iter)
+                except StopIteration:
+                    return set()
+
+            def fake_list_entries_for_terminals(terminals: set[str]):
+                if terminals == {"cmux", "ghostty"}:
+                    return all_entries
+                if terminals == {"ghostty"}:
+                    return ghostty_only_entries
+                return []
+
+            sleep_calls = {"count": 0}
+
+            def fake_sleep(_seconds: float):
+                sleep_calls["count"] += 1
+                if sleep_calls["count"] >= 3:
+                    watcher.RUNNING = False
+
+            with mock.patch.object(watcher, "detect_terminals", side_effect=fake_detect_terminals):
+                with mock.patch.object(
+                    watcher,
+                    "list_entries_for_terminals",
+                    side_effect=fake_list_entries_for_terminals,
+                ):
+                    with mock.patch.object(watcher.time, "sleep", side_effect=fake_sleep):
+                        with mock.patch.object(
+                            watcher, "should_save_on_shutdown", return_value=False
+                        ):
+                            rc = watcher.main()
+
+            self.assertEqual(rc, 0)
+            restored = json.loads(watcher.RESTORE_PATH.read_text(encoding="utf-8"))
+            terminals = ["cmux" if r.get("terminal") == "cmux" else "ghostty" for r in restored]
+            self.assertEqual(sorted(terminals), ["cmux", "ghostty"])
 
     def test_persist_live_state_keeps_previous_non_empty_on_empty_snapshot(self) -> None:
         watcher = load_watcher_module()

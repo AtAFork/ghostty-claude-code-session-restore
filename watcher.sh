@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""ghostty-session-watcher — save Claude/Codex sessions when Ghostty quits."""
+"""ghostty-session-watcher — save Claude/Codex sessions when Ghostty/Cmux quits."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -19,6 +21,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from session_restore_core import (  # noqa: E402
     codex_is_interactive,
     load_restore_file,
+    resolve_claude_session_id_for_pid,
     resolve_codex_session_id_for_pid,
     resolve_sessions,
 )
@@ -26,21 +29,27 @@ from session_restore_core import (  # noqa: E402
 SNAPSHOT_PATH = Path("/tmp/ghostty-session-snapshot.json")
 RESTORE_PATH = Path.home() / ".claude" / "ghostty-restore.json"
 LIVE_STATE_PATH = Path.home() / ".claude" / "ghostty-live-state.json"
-CLAUDE_PROJECTS_PATH = Path.home() / ".claude" / "projects"
+CMUX_WORKSPACE_MAP_PATH = Path.home() / ".claude" / "cmux-workspace-map.json"
 LOG_PATH = Path.home() / ".claude" / "debug" / "ghostty-session-watcher.log"
+CMUX_SOCKET_PATH = Path("/tmp/cmux.sock")
 EMPTY_LIVE_STATE_GRACE_SECONDS = 8.0
+POLL_INTERVAL_SECONDS = 2.0
 
 RUNNING = True
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, returncode=127, stdout="", stderr="")
 
 
 def log(message: str) -> None:
@@ -73,6 +82,30 @@ def is_ghostty_running() -> bool:
     return _run(["pgrep", "-x", "ghostty"]).returncode == 0
 
 
+def _is_cmux_socket_alive() -> bool:
+    """Check if the cmux socket exists and accepts connections."""
+    if not CMUX_SOCKET_PATH.exists():
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect(str(CMUX_SOCKET_PATH))
+        s.close()
+        return True
+    except (OSError, socket.error):
+        return False
+
+
+def detect_terminals() -> set[str]:
+    """Return active terminal modes as a set containing cmux and/or ghostty."""
+    active: set[str] = set()
+    if _is_cmux_socket_alive():
+        active.add("cmux")
+    if _run(["pgrep", "-x", "ghostty"]).returncode == 0:
+        active.add("ghostty")
+    return active
+
+
 def _get_ppid(pid: int) -> int | None:
     out = _run(["ps", "-p", str(pid), "-o", "ppid="]).stdout.strip()
     if not out:
@@ -100,6 +133,76 @@ def is_ghostty_child(pid: int, max_depth: int = 6) -> bool:
     return False
 
 
+def get_cmux_env(pid: int) -> tuple[str, str] | None:
+    """Extract CMUX_WORKSPACE_ID and CMUX_SURFACE_ID from a process environment."""
+    out = _run(["ps", "eww", "-p", str(pid), "-o", "command="]).stdout
+    ws_match = re.search(r"CMUX_WORKSPACE_ID=(\S+)", out)
+    sf_match = re.search(r"CMUX_SURFACE_ID=(\S+)", out)
+    if ws_match and sf_match:
+        return (ws_match.group(1), sf_match.group(1))
+    return None
+
+
+def is_cmux_child(pid: int) -> tuple[str, str] | None:
+    """Return (workspace_id, surface_id) if pid is a cmux child, else None."""
+    return get_cmux_env(pid)
+
+
+def _load_cmux_workspace_map() -> dict[str, str]:
+    """Load workspace UUID -> name mapping written by shell startup snippet."""
+    try:
+        data = json.loads(CMUX_WORKSPACE_MAP_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if k and v}
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def enrich_cmux_entries(entries: list[dict]) -> list[dict]:
+    """Add workspaceName and surfaceIndex to cmux entries.
+
+    Reads workspace UUID -> name mapping from a file maintained by the
+    shell startup snippet (which runs inside cmux and can call the cmux CLI).
+    Surface index is derived from the surface UUID ordering within each workspace.
+    """
+    if not entries:
+        return entries
+
+    ws_id_to_name = _load_cmux_workspace_map()
+
+    for entry in entries:
+        ws_id = entry.get("workspaceId", "")
+        if ws_id and ws_id in ws_id_to_name:
+            entry["workspaceName"] = ws_id_to_name[ws_id]
+
+    # For surface index: group entries by workspace and assign index by
+    # surface UUID sort order within each workspace. This gives a stable
+    # ordering even without calling the cmux CLI.
+    ws_surfaces: dict[str, list[str]] = {}
+    for entry in entries:
+        ws_id = entry.get("workspaceId", "")
+        sf_id = entry.get("surfaceId", "")
+        if ws_id and sf_id:
+            ws_surfaces.setdefault(ws_id, [])
+            if sf_id not in ws_surfaces[ws_id]:
+                ws_surfaces[ws_id].append(sf_id)
+
+    # Build surface id -> index map (sorted by surface UUID for stability)
+    sf_id_to_index: dict[str, int] = {}
+    for ws_id, sf_ids in ws_surfaces.items():
+        sf_ids.sort()
+        for idx, sf_id in enumerate(sf_ids):
+            sf_id_to_index[sf_id] = idx
+
+    for entry in entries:
+        sf_id = entry.get("surfaceId", "")
+        if sf_id and sf_id in sf_id_to_index:
+            entry["surfaceIndex"] = sf_id_to_index[sf_id]
+
+    return entries
+
+
 def get_cwd(pid: int) -> str | None:
     out = _run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]).stdout
     for line in out.splitlines():
@@ -108,7 +211,7 @@ def get_cwd(pid: int) -> str | None:
     return None
 
 
-def list_candidate_processes() -> list[dict]:
+def list_candidate_processes(mode: str = "ghostty") -> list[dict]:
     out = _run(["ps", "-eo", "pid=,tty=,comm=,args="]).stdout
     entries: list[dict] = []
     for line in out.splitlines():
@@ -126,8 +229,13 @@ def list_candidate_processes() -> list[dict]:
         except ValueError:
             continue
 
-        if not is_ghostty_child(pid):
-            continue
+        if mode == "cmux":
+            cmux_ids = is_cmux_child(pid)
+            if not cmux_ids:
+                continue
+        else:
+            if not is_ghostty_child(pid):
+                continue
 
         if tool == "codex" and not codex_is_interactive(args):
             continue
@@ -143,8 +251,15 @@ def list_candidate_processes() -> list[dict]:
             "args": args,
             "tool": tool,
         }
+        if mode == "cmux" and cmux_ids:
+            entry["workspaceId"] = cmux_ids[0]
+            entry["surfaceId"] = cmux_ids[1]
         if tool == "codex":
             sid = resolve_codex_session_id_for_pid(pid)
+            if sid:
+                entry["sessionId"] = sid
+        else:
+            sid = resolve_claude_session_id_for_pid(pid)
             if sid:
                 entry["sessionId"] = sid
         entries.append(entry)
@@ -153,8 +268,27 @@ def list_candidate_processes() -> list[dict]:
     return entries
 
 
+def list_entries_for_terminals(terminals: set[str]) -> list[dict]:
+    entries: list[dict] = []
+    seen_pids: set[int] = set()
+    if "cmux" in terminals:
+        for entry in enrich_cmux_entries(list_candidate_processes(mode="cmux")):
+            pid = int(entry.get("pid") or 0)
+            if pid and pid not in seen_pids:
+                entries.append(entry)
+                seen_pids.add(pid)
+    if "ghostty" in terminals:
+        for entry in list_candidate_processes(mode="ghostty"):
+            pid = int(entry.get("pid") or 0)
+            if pid and pid in seen_pids:
+                continue
+            entries.append(entry)
+    entries.sort(key=lambda x: (x.get("tty", ""), int(x.get("pid") or 0)))
+    return entries
+
+
 def write_snapshot(entries: list[dict]) -> None:
-    SNAPSHOT_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    write_json_atomic(SNAPSHOT_PATH, entries)
 
 
 def write_json_atomic(path: Path, data: object) -> None:
@@ -176,7 +310,7 @@ def load_sessions_file(path: Path) -> list[dict]:
 
 
 def persist_live_state(entries: list[dict]) -> int:
-    sessions = resolve_sessions(entries, str(CLAUDE_PROJECTS_PATH))
+    sessions = resolve_sessions(entries)
     if not sessions:
         # Keep the previous non-empty live state. This avoids clobbering restore
         # data on transient empty snapshots (for example during crash races).
@@ -185,17 +319,41 @@ def persist_live_state(entries: list[dict]) -> int:
     return len(sessions)
 
 
-def save_sessions() -> tuple[int, int, int]:
+def _filter_sessions_by_terminal(sessions: list[dict], terminal: str | None) -> list[dict]:
+    if not terminal:
+        return sessions
+    if terminal == "cmux":
+        return [s for s in sessions if s.get("terminal") == "cmux"]
+    # Ghostty entries are legacy/no-terminal or explicitly non-cmux.
+    return [s for s in sessions if s.get("terminal") != "cmux"]
+
+
+def _merge_with_existing_restore(
+    sessions: list[dict], terminal: str | None
+) -> list[dict]:
+    if not terminal:
+        return sessions
+    existing = load_sessions_file(RESTORE_PATH)
+    if terminal == "cmux":
+        preserved = [s for s in existing if s.get("terminal") != "cmux"]
+    else:
+        preserved = [s for s in existing if s.get("terminal") == "cmux"]
+    return preserved + sessions
+
+
+def save_sessions(terminal: str | None = None) -> tuple[int, int, int]:
     sessions = load_sessions_file(LIVE_STATE_PATH)
+    sessions = _filter_sessions_by_terminal(sessions, terminal)
     if not sessions:
         snapshot = load_snapshot()
         if not snapshot:
             return (0, 0, 0)
-        sessions = resolve_sessions(snapshot, str(CLAUDE_PROJECTS_PATH))
+        sessions = resolve_sessions(snapshot)
+        sessions = _filter_sessions_by_terminal(sessions, terminal)
     if not sessions:
         return (0, 0, 0)
 
-    write_json_atomic(RESTORE_PATH, sessions)
+    write_json_atomic(RESTORE_PATH, _merge_with_existing_restore(sessions, terminal))
 
     resumed = sum(1 for x in sessions if x.get("sessionId"))
     continued = len(sessions) - resumed
@@ -203,7 +361,7 @@ def save_sessions() -> tuple[int, int, int]:
 
 
 def should_save_on_shutdown() -> bool:
-    if is_ghostty_running():
+    if is_ghostty_running() or _is_cmux_socket_alive():
         return True
     snapshot = load_snapshot()
     return bool(snapshot)
@@ -221,6 +379,13 @@ def should_clear_live_state_for_empty_period(
     return (now - empty_started_at) >= grace_seconds
 
 
+def terminal_scope_for_final_save(prev_terminals: set[str]) -> str | None:
+    """Use terminal-scoped save when exactly one terminal just closed."""
+    if len(prev_terminals) == 1:
+        return next(iter(prev_terminals))
+    return None
+
+
 def snapshot_log_message(
     entries: list[dict], prev_unresolved_codex_pids: tuple[int, ...]
 ) -> tuple[str, tuple[int, ...]]:
@@ -234,7 +399,7 @@ def snapshot_log_message(
     base = f"Snapshot: {len(entries)} session(s)"
     if unresolved_codex_pids and unresolved_codex_pids != prev_unresolved_codex_pids:
         return (
-            f"{base} ({len(unresolved_codex_pids)} codex unresolved -> --last fallback)",
+            f"{base} ({len(unresolved_codex_pids)} codex unresolved -> new-session fallback)",
             unresolved_codex_pids,
         )
     return base, unresolved_codex_pids
@@ -243,7 +408,7 @@ def snapshot_log_message(
 def main() -> int:
     log(f"Started (PID {os.getpid()})")
 
-    ghostty_was_running = False
+    prev_terminals: set[str] = set()
     prev_signature: tuple = tuple()
     prev_unresolved_codex_pids: tuple[int, ...] = tuple()
     empty_started_at: float | None = None
@@ -251,9 +416,27 @@ def main() -> int:
     n = 0
 
     while RUNNING:
-        if is_ghostty_running():
-            ghostty_was_running = True
-            entries = list_candidate_processes()
+        terminals = detect_terminals()
+
+        if terminals:
+            closed_terminals = prev_terminals - terminals
+            for closed in sorted(closed_terminals):
+                log(f"{closed.capitalize()} closed while other terminal active - saving")
+                total, resumed, continued = save_sessions(terminal=closed)
+                if total:
+                    log(
+                        f"Sessions saved: {total} total "
+                        f"({resumed} resume, {continued} continue)"
+                    )
+                else:
+                    log(f"No {closed} sessions to save")
+            if terminals != prev_terminals:
+                detected = "+".join(sorted(terminals))
+                log(f"Terminal detected: {detected}")
+                prev_terminals = set(terminals)
+
+            entries = list_entries_for_terminals(terminals)
+
             now = time.monotonic()
             if entries:
                 empty_started_at = None
@@ -271,7 +454,15 @@ def main() -> int:
                     log("No active sessions for 8s - cleared live state")
 
             signature = tuple(
-                (entry["pid"], entry.get("sessionId"), entry["args"]) for entry in entries
+                (
+                    entry["pid"],
+                    entry.get("sessionId"),
+                    entry.get("cwd", ""),
+                    entry["args"],
+                    entry.get("workspaceId", ""),
+                    entry.get("surfaceId", ""),
+                )
+                for entry in entries
             )
             if signature != prev_signature:
                 prev_signature = signature
@@ -281,9 +472,11 @@ def main() -> int:
                     entries, prev_unresolved_codex_pids
                 )
                 log(message)
-        elif ghostty_was_running:
-            log("Ghostty quit - saving")
-            total, resumed, continued = save_sessions()
+        elif prev_terminals:
+            label = "+".join(sorted(prev_terminals))
+            log(f"{label.capitalize()} quit - saving")
+            save_terminal = terminal_scope_for_final_save(prev_terminals)
+            total, resumed, continued = save_sessions(terminal=save_terminal)
             if total:
                 log(
                     f"Sessions saved: {total} total "
@@ -291,7 +484,8 @@ def main() -> int:
                 )
             else:
                 log("No sessions to save")
-            ghostty_was_running = False
+
+            prev_terminals = set()
             prev_signature = tuple()
             prev_unresolved_codex_pids = tuple()
             empty_started_at = None
@@ -302,7 +496,7 @@ def main() -> int:
         if n == 0:
             truncate_log()
 
-        time.sleep(2)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
     log("Shutting down")
     # Best-effort: persist latest sessions if this process likely observed active state.
