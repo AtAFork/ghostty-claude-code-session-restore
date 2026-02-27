@@ -57,7 +57,7 @@ Only processes with a Ghostty ancestor in their PPID chain are captured. This ex
 #### Claude
 
 1. Use `--resume <id>` if present in process args.
-2. Otherwise resolve by project history in `~/.claude/projects`, filtered to real conversations (`"type":"user"` present).
+2. Otherwise extract session ID from open project files via `lsof` (`~/.claude/projects/.../<uuid>.jsonl`).
 3. Fallback to `claude --continue` when no session ID can be resolved.
 
 #### Codex
